@@ -23,6 +23,7 @@ typedef enum {
   GST_TEST_SUITE_AI,
   GST_TEST_SUITE_ML,
   GST_TEST_SUITE_CV,
+  GST_TEST_SUITE_TOF,
   GST_TEST_SUITE_MAX
 } GstPluginSuiteIdx;
 
@@ -41,6 +42,9 @@ gst_plugin_get_camera_suite (GstPluginSuite* psuite);
 
 GST_API void
 gst_plugin_get_ml_suite (GstPluginSuite* psuite);
+
+GST_API void
+gst_plugin_get_tof_suite (GstPluginSuite* psuite);
 
 G_END_DECLS
 

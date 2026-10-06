@@ -33,6 +33,7 @@ static const GEnumValue suite_values[] =
   { GST_TEST_SUITE_CAMERA, "camera suite", "camera" },
   { GST_TEST_SUITE_AI, "AI suite", "ai" },
   { GST_TEST_SUITE_ML, "machine learning suite", "ml" },
+  { GST_TEST_SUITE_TOF, "Arducam ToF suite (qtitofsrc, qtitofdepth)", "tof" },
   // Add new suites.
   { 0, NULL, NULL }
 };
@@ -98,7 +99,7 @@ static void gst_plugin_suite_help (GstPluginSuite *psuite)
         "gst-test-framework");
     gst_printerr ("\n");
     gst_printerr (
-        "  -s: Suite names, could be camera/ml\n"
+        "  -s: Suite names, could be camera/ml/tof\n"
         "  -i: Iteration times for each test, default is 1 time\n"
         "  -d: Running time for each test in seconds, default is 10 seconds\n"
         "  -h: Print available test case names when -s is configured");
@@ -130,6 +131,9 @@ static gboolean gst_plugin_get_suite (GstPluginSuite *psuite)
       break;
     case GST_TEST_SUITE_ML:
       GST_PLUGIN_GET_SUITE (ml, psuite);
+      break;
+    case GST_TEST_SUITE_TOF:
+      GST_PLUGIN_GET_SUITE (tof, psuite);
       break;
     default:
       ret = FALSE;

@@ -26,6 +26,7 @@ add_executable(${GST_TEST_FRAMEWORK}
   suite-camera/suite-camera-pipeline.c
   suite-ML/suite-ml-case.c
   suite-ML/suite-ml-pipeline.c
+  suite-tof/suite-tof-case.c
 )
 
 target_include_directories(${GST_TEST_FRAMEWORK} PRIVATE
@@ -38,6 +39,7 @@ target_link_libraries(${GST_TEST_FRAMEWORK} PRIVATE
   ${GST_CHECK_LIBRARIES}
   ${GST_PBUTILS_LIBRARIES}
   ${GST_VIDEO_LIBRARIES}
+  m
 )
 
 install(
