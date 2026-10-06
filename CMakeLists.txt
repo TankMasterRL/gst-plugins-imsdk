@@ -68,6 +68,9 @@ option(ENABLE_GST_PLUGIN_SOCKET "Enable gst-plugin-socket" ${ENABLE_GST_SOFTWARE
 option(ENABLE_GST_PLUGIN_URIDECODEBIN "Enable gst-plugin-uridecodebin" ${ENABLE_GST_SOFTWARE_PLUGINS})
 option(ENABLE_GST_PLUGIN_VIDEOTEMPLATE "Enable gst-plugin-videotemplate" ${ENABLE_GST_SOFTWARE_PLUGINS})
 
+# Arducam ToF camera on the CAMSS RDI path (fork addition, DEC-0020)
+option(ENABLE_GST_PLUGIN_TOF "Enable gst-plugin-tof" OFF)
+
 # Sample Apps and Test Framework
 option(ENABLE_GST_PLUGIN_EXAMPLES "Enable gst-plugin-examples" OFF)
 option(ENABLE_GST_PYTHON_EXAMPLES "Enable gst-python-examples" OFF)
@@ -173,6 +176,7 @@ add_plugin_if(ENABLE_GST_PLUGIN_RTSPBIN         gst-plugin-rtspbin)
 add_plugin_if(ENABLE_GST_PLUGIN_SOCKET          gst-plugin-socket)
 add_plugin_if(ENABLE_GST_PLUGIN_URIDECODEBIN    gst-plugin-uridecodebin)
 add_plugin_if(ENABLE_GST_PLUGIN_VIDEOTEMPLATE   gst-plugin-videotemplate)
+add_plugin_if(ENABLE_GST_PLUGIN_TOF            gst-plugin-tof)
 
 # Software Plugins (prop)
 add_plugin_if(ENABLE_GST_PLUGIN_SMARTVENCBIN    gst-plugin-smartvencbin)
