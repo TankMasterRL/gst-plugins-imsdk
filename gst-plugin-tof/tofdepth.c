@@ -50,8 +50,9 @@ GST_DEBUG_CATEGORY_STATIC (gst_tof_depth_debug);
 #define DEFAULT_TEMPORAL_AVERAGE 1
 
 #define DEPTH_FORMATS "{ GRAY16_LE, RGBA, BGRA, RGB, BGR, GRAY8 }"
-#define AMPLITUDE_FORMATS "{ GRAY16_LE, GRAY8 }"
-#define CONFIDENCE_FORMATS "{ GRAY8, GRAY16_LE }"
+/* RGB(A) variants replicate the grey value: qtivcomposer (GLES) shows GRAY8 as red only (RUN-0049) */
+#define AMPLITUDE_FORMATS "{ GRAY16_LE, GRAY8, RGBA, BGRA, RGB, BGR }"
+#define CONFIDENCE_FORMATS "{ GRAY8, GRAY16_LE, RGBA, BGRA, RGB, BGR }"
 #define VIDEO_CAPS(formats) \
   "video/x-raw, format=(string)" formats ", width=(int)240, height=(int)180, " \
   "framerate=(fraction)[ 0/1, 1000/1 ]"
@@ -485,19 +486,35 @@ fill_scalar (GstTofDepth * self, GstVideoFrame * vf, gboolean confidence)
     const gfloat *a = self->amp + y * GST_TOF_WIDTH, *d = self->dist + y * GST_TOF_WIDTH;
 
     for (guint x = 0; x < GST_TOF_WIDTH; x++) {
-      if (confidence) {
-        gfloat c = d[x] > 0.0f ? MIN (1.0f, a[x] / cscale) : 0.0f;
+      guint8 g;
 
-        if (fmt == GST_VIDEO_FORMAT_GRAY8)
-          row[x] = d[x] > 0.0f ? (guint8) CLAMP (lrintf (255.0f * c), 1, 255) : 0;
-        else
-          GST_WRITE_UINT16_LE (row + 2 * x,
-              d[x] > 0.0f ? (guint16) CLAMP (lrintf (65535.0f * c), 1, 65535) : 0);
-      } else {
-        if (fmt == GST_VIDEO_FORMAT_GRAY8)
-          row[x] = (guint8) CLAMP (lrintf (255.0f * a[x] / amax), 0, 255);
+      if (fmt == GST_VIDEO_FORMAT_GRAY16_LE) {
+        if (confidence)
+          GST_WRITE_UINT16_LE (row + 2 * x, d[x] > 0.0f ?
+              (guint16) CLAMP (lrintf (65535.0f * MIN (1.0f, a[x] / cscale)), 1, 65535) : 0);
         else
           GST_WRITE_UINT16_LE (row + 2 * x, (guint16) CLAMP (lrintf (a[x]), 0, 65535));
+        continue;
+      }
+      if (confidence)
+        g = d[x] > 0.0f ? (guint8) CLAMP (lrintf (255.0f * MIN (1.0f, a[x] / cscale)), 1, 255) : 0;
+      else
+        g = (guint8) CLAMP (lrintf (255.0f * a[x] / amax), 0, 255);
+      switch (fmt) {
+        case GST_VIDEO_FORMAT_GRAY8:
+          row[x] = g;
+          break;
+        case GST_VIDEO_FORMAT_RGBA:
+        case GST_VIDEO_FORMAT_BGRA:
+          row[4 * x] = row[4 * x + 1] = row[4 * x + 2] = g;
+          row[4 * x + 3] = 255;
+          break;
+        case GST_VIDEO_FORMAT_RGB:
+        case GST_VIDEO_FORMAT_BGR:
+          row[3 * x] = row[3 * x + 1] = row[3 * x + 2] = g;
+          break;
+        default:
+          break;
       }
     }
   }
