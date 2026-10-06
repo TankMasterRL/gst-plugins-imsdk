@@ -11,6 +11,7 @@
 
 #include "tofdcs.h"
 #include "tofsrc.h"
+#include "tofdepth.h"
 
 GType
 gst_tof_range_get_type (void)
@@ -33,7 +34,9 @@ static gboolean
 plugin_init (GstPlugin * plugin)
 {
   return gst_element_register (plugin, "qtitofsrc", GST_RANK_NONE,
-      GST_TYPE_TOF_SRC);
+      GST_TYPE_TOF_SRC) &&
+      gst_element_register (plugin, "qtitofdepth", GST_RANK_NONE,
+      GST_TYPE_TOF_DEPTH);
 }
 
 GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
