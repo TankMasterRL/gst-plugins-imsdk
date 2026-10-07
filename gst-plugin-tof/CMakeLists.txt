@@ -21,6 +21,10 @@ pkg_check_modules(GST_QCOM_VIDEO
 pkg_check_modules(GST_QCOM_ALLOC
   REQUIRED gstreamer-qcom-oss-allocators-1.0>=1.0.0)
 
+# qtitofdepth: calibration used when the property is unset (installed by gstreamer1.0-qtitof, arducam-tof-ventuno DEC-0026)
+set(TOF_DEFAULT_CALIBRATION "/usr/share/arducam-tof/tof-depth-cal-v1.conf"
+    CACHE STRING "Calibration key file qtitofdepth loads when calibration is unset")
+
 # Generate configuration header file with plugin describing definitions
 configure_file(config.h.in config.h @ONLY)
 include_directories(${CMAKE_CURRENT_BINARY_DIR})

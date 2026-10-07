@@ -8,6 +8,8 @@
  *   range-switch  range far -> near in PLAYING: header mode follows, settle drops counted
  *   depth         qtitofdepth on synthetic groups (known phase per pixel) vs the analytic distance,
  *                 uncalibrated (near) and with a pure-offset calibration key file (far)
+ *   calibration   calibration unset: the default from GST_TOF_CALIBRATION is used; a missing default
+ *                 makes READY -> PAUSED fail; the stats name the file in use (arducam-tof-ventuno DEC-0026)
  * The live cases need the Arducam ToF on CAMERA0 with the ToF boot entry and drivers loaded.
  */
 
@@ -308,8 +310,8 @@ GST_START_TEST (test_tof_depth_synthetic)
   const gchar *cal = "[calibration]\nformat=2\n"
       "[far]\nR=4.0\nphi_ref=1.234\nc0=0.1\n[near]\nR=2.0\nphi_ref=-0.5\nc0=-0.05\n";
 
-  /* uncalibrated: phi_ref 0, no correction, near mode R = 2 m */
-  check_depth ("qtitofdepth", 1, 2.0, 0.0, 0.0);
+  /* explicitly uncalibrated: phi_ref 0, no correction, near mode R = 2 m */
+  check_depth ("qtitofdepth calibration=\"\"", 1, 2.0, 0.0, 0.0);
 
   fail_unless (fd >= 0);
   fail_unless (g_file_set_contents (path, cal, -1, NULL));
@@ -318,6 +320,52 @@ GST_START_TEST (test_tof_depth_synthetic)
   check_depth (launch, 0, 4.0, 1.234, 0.1);
   check_depth (launch, 1, 2.0, -0.5, -0.05);
   g_free (launch);
+  g_unlink (path);
+  g_free (path);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_tof_calibration_default)
+{
+  gchar *path = NULL, *used = NULL;
+  gint fd = g_file_open_tmp ("tof-cal-XXXXXX.conf", &path, NULL);
+  const gchar *cal = "[calibration]\nformat=2\n"
+      "[far]\nR=4.0\nphi_ref=0.75\nc0=0.02\n[near]\nR=2.0\nphi_ref=0.3\nc0=-0.01\n";
+  GstElement *depth;
+  GstStructure *stats;
+
+  fail_unless (fd >= 0);
+  fail_unless (g_file_set_contents (path, cal, -1, NULL));
+  close (fd);
+
+  /* unset -> the default named by GST_TOF_CALIBRATION, applied to the depth */
+  g_setenv ("GST_TOF_CALIBRATION", path, TRUE);
+  check_depth ("qtitofdepth", 0, 4.0, 0.75, 0.02);
+  check_depth ("qtitofdepth", 1, 2.0, 0.3, -0.01);
+  depth = gst_element_factory_make ("qtitofdepth", NULL);
+  fail_unless_equals_int (gst_element_set_state (depth, GST_STATE_PAUSED), GST_STATE_CHANGE_SUCCESS);
+  g_object_get (depth, "stats", &stats, NULL);
+  used = g_strdup (gst_structure_get_string (stats, "calibration"));
+  fail_unless_equals_string (used, path);
+  gst_structure_free (stats);
+  g_free (used);
+  gst_element_set_state (depth, GST_STATE_NULL);
+
+  /* unset and no default file -> refuses to start */
+  g_setenv ("GST_TOF_CALIBRATION", "/nonexistent/tof-depth-cal.conf", TRUE);
+  fail_unless_equals_int (gst_element_set_state (depth, GST_STATE_PAUSED), GST_STATE_CHANGE_FAILURE);
+  gst_element_set_state (depth, GST_STATE_NULL);
+
+  /* calibration="" -> uncalibrated, whatever the default */
+  g_object_set (depth, "calibration", "", NULL);
+  fail_unless_equals_int (gst_element_set_state (depth, GST_STATE_PAUSED), GST_STATE_CHANGE_SUCCESS);
+  g_object_get (depth, "stats", &stats, NULL);
+  fail_unless_equals_string (gst_structure_get_string (stats, "calibration"), "");
+  gst_structure_free (stats);
+  gst_element_set_state (depth, GST_STATE_NULL);
+
+  gst_object_unref (depth);
+  g_unsetenv ("GST_TOF_CALIBRATION");
   g_unlink (path);
   g_free (path);
 }
@@ -345,6 +393,12 @@ tof_suite (GList ** tcnames, gint iteration, gint duration)
   *tcnames = g_list_append (*tcnames, (gpointer) tcname);
   suite_add_tcase (s, tc);
   tcase_add_loop_test (tc, test_tof_depth_synthetic, start, end);
+
+  tcname = "calibration";
+  tc = tcase_create (tcname);
+  *tcnames = g_list_append (*tcnames, (gpointer) tcname);
+  suite_add_tcase (s, tc);
+  tcase_add_loop_test (tc, test_tof_calibration_default, start, end);
 
   tcname = "stream";
   tc = tcase_create (tcname);

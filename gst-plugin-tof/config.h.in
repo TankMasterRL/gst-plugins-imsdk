@@ -8,3 +8,5 @@
 #define PACKAGE_LICENSE "BSD"
 #define PACKAGE_SUMMARY "Arducam ToF camera elements for the QIM SDK (fork of gst-plugins-imsdk)"
 #define PACKAGE_ORIGIN  "https://github.com/qualcomm/gst-plugins-imsdk (fork, branch tof/main)"
+
+#define TOF_DEFAULT_CALIBRATION "@TOF_DEFAULT_CALIBRATION@"

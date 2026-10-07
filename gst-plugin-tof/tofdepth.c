@@ -132,6 +132,7 @@ struct _GstTofDepth
 
   /* properties (object lock) */
   gchar *calibration;
+  gchar *calibration_used;      /* file in use, "" = uncalibrated (stats) */
   gdouble min_amplitude;
   gdouble min_distance;
   gdouble max_distance;
@@ -300,8 +301,29 @@ load_models (GstTofDepth * self)
   model_init_nominal (&self->models[GST_TOF_RANGE_NEAR], 2.0);
   self->models_loaded = TRUE;
   if (!path) {
-    GST_ELEMENT_WARNING (self, RESOURCE, SETTINGS, ("No calibration: depth is not metric."),
-        ("Set calibration= to a key file written by tools/tof-sweep.py (CAL_OUT=*.conf)."));
+    /* unset: the installed calibration (DEC-0026) */
+    const gchar *env = g_getenv ("GST_TOF_CALIBRATION");
+
+    path = g_strdup (env && *env ? env : TOF_DEFAULT_CALIBRATION);
+    if (!g_file_test (path, G_FILE_TEST_IS_REGULAR)) {
+      GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
+          ("No depth calibration: %s does not exist.", path),
+          ("Set calibration= to a key file written by tools/tof-sweep.py (CAL_OUT=*.conf), or "
+              "calibration=\"\" for uncalibrated depth (not metric); GST_TOF_CALIBRATION sets the default."));
+      GST_OBJECT_LOCK (self);
+      g_clear_pointer (&self->calibration_used, g_free);
+      GST_OBJECT_UNLOCK (self);
+      g_free (path);
+      return FALSE;
+    }
+    GST_INFO_OBJECT (self, "calibration unset: using %s", path);
+  }
+  if (!*path) {
+    GST_INFO_OBJECT (self, "calibration=\"\": uncalibrated depth, not metric");
+    GST_OBJECT_LOCK (self);
+    g_free (self->calibration_used);
+    self->calibration_used = path;
+    GST_OBJECT_UNLOCK (self);
     return TRUE;
   }
   kf = g_key_file_new ();
@@ -316,7 +338,12 @@ load_models (GstTofDepth * self)
     GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("Invalid calibration %s.", path), (NULL));
   }
   g_key_file_free (kf);
-  g_free (path);
+  GST_OBJECT_LOCK (self);
+  g_free (self->calibration_used);
+  self->calibration_used = ok ? path : NULL;
+  GST_OBJECT_UNLOCK (self);
+  if (!ok)
+    g_free (path);
   return ok;
 }
 
@@ -1295,6 +1322,7 @@ gst_tof_depth_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_STATS:
       g_value_take_boxed (value, gst_structure_new ("stats",
               "groups", G_TYPE_UINT64, self->n_groups,
+              "calibration", G_TYPE_STRING, self->calibration_used,
               "mean-process-us", G_TYPE_DOUBLE,
               self->n_groups ? self->proc_ns / 1000.0 / self->n_groups : 0.0, NULL));
       break;
@@ -1311,6 +1339,7 @@ gst_tof_depth_finalize (GObject * object)
   GstTofDepth *self = GST_TOF_DEPTH (object);
 
   g_free (self->calibration);
+  g_free (self->calibration_used);
   g_free (self->dist);
   g_free (self->amp);
   g_free (self->sum_i);
@@ -1334,8 +1363,9 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_CALIBRATION,
       g_param_spec_string ("calibration", "Calibration",
-          "Key file with the per-mode depth model (tools/tof-sweep.py CAL_OUT=*.conf); "
-          "NULL = uncorrected, not metric", NULL, rw | GST_PARAM_MUTABLE_READY));
+          "Key file with the per-mode depth model (tools/tof-sweep.py CAL_OUT=*.conf); unset = "
+          "$GST_TOF_CALIBRATION or " TOF_DEFAULT_CALIBRATION " (error if missing); \"\" = uncalibrated, "
+          "not metric", NULL, rw | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_MIN_AMPLITUDE,
       g_param_spec_double ("min-amplitude", "Minimum amplitude",
           "Pixels with a lower amplitude (counts) are invalid (0)", 0.0, 1024.0,
@@ -1374,7 +1404,7 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
           "(4 ms + 2.5 ms per linked output)", -1, GST_SECOND, DEFAULT_PROCESSING_LATENCY,
           rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_STATS,
-      g_param_spec_boxed ("stats", "Statistics", "groups, mean-process-us",
+      g_param_spec_boxed ("stats", "Statistics", "groups, calibration (file in use, \"\" = none), mean-process-us",
           GST_TYPE_STRUCTURE, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_add_static_pad_template (element_class, &sink_template);

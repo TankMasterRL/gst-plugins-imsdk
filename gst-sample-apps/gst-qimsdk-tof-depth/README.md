@@ -17,7 +17,7 @@ Generated with the `qimsdk-gstreamer-app-builder` skill and reviewed (arducam-to
 
 ### Text Summary
 
-`qtitofsrc` (range `far`, 300 groups) → `qtitofdepth` (calibration v1) → `capsfilter` `video/x-raw,format=GRAY16_LE,
+`qtitofsrc` (range `far`, 300 groups) → `qtitofdepth` (installed calibration) → `capsfilter` `video/x-raw,format=GRAY16_LE,
 width=240,height=180,framerate=30/1` → `appsink` (`new-sample`: centre distance per frame, printed every 30 frames;
 `eos`: final `stats`). A main-loop timeout sets `range` = `near` on `qtitofsrc` after 5 s while PLAYING.
 
@@ -36,11 +36,11 @@ flowchart LR
 
 | Placeholder | Description |
 |---|---|
-| `CALIBRATION_FILE` (`#define` in `main.c`) | device-specific absolute path of the depth calibration key file; set to `/home/arduino/Downloads/arducam-tof-ventuno/calib/tof-depth-cal-v1.conf` on the project's board — change it for another user/workspace (C string literals do not expand `$HOME`) |
+| (none) | `calibration` is left unset: `qtitofdepth` uses `/usr/share/arducam-tof/tof-depth-cal-v1.conf` or `$GST_TOF_CALIBRATION` (DEC-0026) |
 
 ## Steps to Run
 
-All files the app references (the calibration key file, and the `qtitof` plugin of this fork on `GST_PLUGIN_PATH`)
+All files the app references (the installed calibration, and the `qtitof` plugin of this fork on `GST_PLUGIN_PATH`)
 must be present on the device at their referenced paths before running.
 
 ```bash
@@ -73,9 +73,9 @@ received 300 depth frames, 29.81 frames/s (PTS), 0 without a valid centre
 
 - `qtitofsrc` / `qtitofdepth` are the elements of this fork's `gst-plugin-tof` (`-DENABLE_GST_PLUGIN_TOF=ON`); they
   are not in the skill's plugin catalog. Properties used: `range` (enum, mutable in PLAYING), `num-buffers`,
-  `firmware-version`, `device-id`, `stats` (`qtitofsrc`); `calibration` (`qtitofdepth`).
-- Without `calibration`, `qtitofdepth` outputs uncorrected, non-metric depth and posts a warning (printed by the
-  utils' `warning_cb` with an "ERROR:" prefix).
+  `firmware-version`, `device-id`, `stats` (`qtitofsrc`).
+- Without any calibration file `qtitofdepth` stops at start with an error naming the way out; `calibration=""` asks for
+  uncalibrated (non-metric) depth explicitly (DEC-0026, arducam-tof-ventuno RUN-0066).
 - Near mode is unambiguous only up to 2.0 m (far: 4.0 m); a target beyond that wraps around.
 - `groups-incomplete` may be 1: an incomplete group at stream start, before the first group is pushed.
 - Built in the 1.8.1 fork tree; the `<gst/sampleapps/gst_sample_apps_utils.h>` include resolves through the utils

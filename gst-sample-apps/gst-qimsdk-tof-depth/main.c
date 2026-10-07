@@ -26,9 +26,8 @@
 #define SWITCH_RANGE    "near"
 #define SWITCH_AT_S     5
 
-/* Depth calibration (key file of tools/tof-sweep.py, calibration v1); without it
- * qtitofdepth outputs uncorrected, non-metric depth. Device-specific absolute path. */
-#define CALIBRATION_FILE "/home/arduino/Downloads/arducam-tof-ventuno/calib/tof-depth-cal-v1.conf"
+/* Depth calibration: qtitofdepth loads the installed one (/usr/share/arducam-tof/tof-depth-cal-v1.conf,
+ * or $GST_TOF_CALIBRATION) when "calibration" is unset, and refuses to start without one (DEC-0026). */
 
 /* qtitofdepth output: 240x180 GRAY16_LE, value = distance in mm, 0 = invalid. */
 #define DEPTH_WIDTH     240
@@ -227,7 +226,7 @@ create_pipe (GstAppContext * appctx, TofDepthState * state)
   gst_element_set_enum_property (tofsrc, "range", START_RANGE);
   /* num-buffers ends the stream (EOS) after DURATION_S seconds of groups */
   g_object_set (G_OBJECT (tofsrc), "num-buffers", DURATION_S * DEPTH_FPS, NULL);
-  g_object_set (G_OBJECT (tofdepth), "calibration", CALIBRATION_FILE, NULL);
+  /* "calibration" left unset: the installed calibration (see above) */
 
   caps = gst_caps_new_simple ("video/x-raw",
       "format", G_TYPE_STRING, "GRAY16_LE",

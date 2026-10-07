@@ -5,7 +5,6 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 ################################################################################
 
-import os
 import sys
 import time
 import signal
@@ -24,9 +23,6 @@ with the standard GStreamer Python API: it prints the distance at the image
 centre once per second, switches the range mode while the pipeline is PLAYING,
 and reads the source's controls and statistics back.
 """
-DEFAULT_CALIBRATION = os.path.join(
-    os.path.expanduser("~"),
-    "Downloads/arducam-tof-ventuno/calib/tof-depth-cal-v1.conf")
 
 # qtitofdepth output: 240x180 GRAY16_LE, value = distance in mm, 0 = invalid.
 DEPTH_WIDTH = 240
@@ -196,8 +192,9 @@ def parse_arguments():
         help='Run length in seconds (30 depth frames per second)'
     )
     parser.add_argument(
-        '-c', '--calibration', type=str, default=DEFAULT_CALIBRATION,
-        help='Depth calibration key file (tools/tof-sweep.py); without it depth is not metric'
+        '-c', '--calibration', type=str, default=None,
+        help='Depth calibration key file (tools/tof-sweep.py); default: the installed one '
+             '(/usr/share/arducam-tof/tof-depth-cal-v1.conf or $GST_TOF_CALIBRATION)'
     )
 
     return parser.parse_args()
@@ -217,7 +214,8 @@ def create_pipeline(pipeline, args):
     elements["tofsrc"].set_property("range", args.range)
     # num-buffers ends the stream (EOS) after the run length
     elements["tofsrc"].set_property("num-buffers", args.duration * DEPTH_FPS)
-    elements["tofdepth"].set_property("calibration", args.calibration)
+    if args.calibration is not None:
+        elements["tofdepth"].set_property("calibration", args.calibration)
     # Metric output of qtitofdepth (millimetres)
     elements["depthcaps"].set_property(
         "caps", Gst.Caps.from_string(
