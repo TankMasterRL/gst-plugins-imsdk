@@ -28,6 +28,11 @@
 #include <math.h>
 #include <string.h>
 
+#if defined(__aarch64__) && defined(__ARM_NEON) && G_BYTE_ORDER == G_LITTLE_ENDIAN
+#include <arm_neon.h>
+#define TOF_HAVE_NEON 1
+#endif
+
 #include <gst/base/gstflowcombiner.h>
 #include <gst/video/video.h>
 #include <gst/allocators/gstqtiallocator.h>
@@ -149,6 +154,11 @@ struct _GstTofDepth
 
 #define gst_tof_depth_parent_class parent_class
 G_DEFINE_TYPE (GstTofDepth, gst_tof_depth, GST_TYPE_ELEMENT);
+
+#ifdef TOF_HAVE_NEON
+/* NEON path (RUN-0064) unless GST_TOF_DEPTH_SCALAR is set: the scalar code is the reference */
+static gboolean use_simd = FALSE;
+#endif
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK, GST_PAD_ALWAYS, GST_STATIC_CAPS (GST_TOF_DCS_CAPS));
@@ -323,6 +333,86 @@ build_turbo (guint8 lut[256][3])
 
 /* ---------------------------------------------------------------- computation */
 
+#ifdef TOF_HAVE_NEON
+/* atan (t), t in [0, 1] = t (1 + c2 t^2 + ... + c16 t^16): Abramowitz & Stegun 4.4.49, |error| <= 2e-8 rad,
+ * i.e. < 0.1 um of depth at R = 4 m; the float rounding (~1e-7 rad) dominates */
+static const gfloat atan_c[8] = { -0.3333314528f, 0.1999355085f, -0.1420889944f, 0.1065626393f,
+  -0.0752896400f, 0.0429096138f, -0.0161657367f, 0.0028662257f
+};
+
+static inline float32x4_t
+atan2_f32x4 (float32x4_t y, float32x4_t x)
+{
+  const float32x4_t zero = vdupq_n_f32 (0.0f);
+  float32x4_t ax = vabsq_f32 (x), ay = vabsq_f32 (y);
+  float32x4_t mx = vmaxq_f32 (ax, ay), mn = vminq_f32 (ax, ay);
+  float32x4_t t = vdivq_f32 (mn, vbslq_f32 (vceqq_f32 (mx, zero), vdupq_n_f32 (1.0f), mx));
+  float32x4_t z = vmulq_f32 (t, t), p = vdupq_n_f32 (atan_c[7]), r;
+
+  for (gint k = 6; k >= 0; k--)
+    p = vfmaq_f32 (vdupq_n_f32 (atan_c[k]), p, z);
+  r = vmulq_f32 (t, vfmaq_f32 (vdupq_n_f32 (1.0f), p, z));
+  /* octants: |y| > |x| -> pi/2 - r; x < 0 -> pi - r; y < 0 -> -r (atan2 (+0, x < 0) = +pi as libm) */
+  r = vbslq_f32 (vcgtq_f32 (ay, ax), vsubq_f32 (vdupq_n_f32 ((gfloat) G_PI_2), r), r);
+  r = vbslq_f32 (vcltq_f32 (x, zero), vsubq_f32 (vdupq_n_f32 ((gfloat) G_PI), r), r);
+  return vbslq_f32 (vcltq_f32 (y, zero), vnegq_f32 (r), r);
+}
+
+/* the per-pixel loop of compute (), 4 pixels per step; same operations and order as the scalar loop */
+static void
+compute_neon (GstTofDepth * self, const gint16 * f0, const gint16 * f1, const gint16 * f2,
+    const gint16 * f3, const TofModel * m, gfloat min_amp, guint navg, gboolean want_depth)
+{
+  const float32x4_t zero = vdupq_n_f32 (0.0f), two_pi = vdupq_n_f32 ((gfloat) TWO_PI);
+  const float32x4_t ref = vdupq_n_f32 ((gfloat) m->phi_ref), r = vdupq_n_f32 ((gfloat) m->r);
+  const float32x4_t scale = vdupq_n_f32 (LUT_SIZE / (gfloat) TWO_PI);
+  const float32x4_t vmin_amp = vdupq_n_f32 (min_amp), count = vdupq_n_f32 ((gfloat) self->hist_count);
+  const int32x4_t hi = vdupq_n_s32 (1023), lo = vdupq_n_s32 (-1024);
+  const uint32x4_t kmax = vdupq_n_u32 (LUT_SIZE - 1);
+  const gfloat *lut = m->lut;
+
+  for (guint p = 0; p < N_PIX; p += 4) {
+    int32x4_t s0 = vmovl_s16 (vld1_s16 (f0 + p)), s1 = vmovl_s16 (vld1_s16 (f1 + p));
+    int32x4_t s2 = vmovl_s16 (vld1_s16 (f2 + p)), s3 = vmovl_s16 (vld1_s16 (f3 + p));
+    uint32x4_t rail = vorrq_u32 (vorrq_u32 (vcgeq_s32 (s0, hi), vcleq_s32 (s0, lo)),
+        vorrq_u32 (vcgeq_s32 (s1, hi), vcleq_s32 (s1, lo)));
+    float32x4_t i, q, a, d;
+    uint32x4_t invalid;
+
+    rail = vorrq_u32 (rail, vorrq_u32 (vorrq_u32 (vcgeq_s32 (s2, hi), vcleq_s32 (s2, lo)),
+            vorrq_u32 (vcgeq_s32 (s3, hi), vcleq_s32 (s3, lo))));
+    if (navg > 1) {
+      i = vdivq_f32 (vld1q_f32 (self->sum_i + p), count);
+      q = vdivq_f32 (vld1q_f32 (self->sum_q + p), count);
+    } else {
+      i = vcvtq_f32_s32 (vsubq_s32 (s0, s2));
+      q = vcvtq_f32_s32 (vsubq_s32 (s1, s3));
+    }
+    a = vmulq_f32 (vsqrtq_f32 (vfmaq_f32 (vmulq_f32 (i, i), q, q)), vdupq_n_f32 (0.5f));
+    vst1q_f32 (self->amp + p, a);
+    invalid = vorrq_u32 (rail, vcltq_f32 (a, vmin_amp));
+    if (want_depth) {
+      float32x4_t u = vsubq_f32 (ref, atan2_f32x4 (q, i)), x, l0, l1;
+      guint32 k[4];
+      uint32x4_t kv;
+
+      u = vfmsq_f32 (u, two_pi, vrndmq_f32 (vdivq_f32 (u, two_pi)));
+      x = vmulq_f32 (u, scale);
+      kv = vminq_u32 (vcvtq_u32_f32 (x), kmax);
+      vst1q_u32 (k, kv);
+      l0 = (float32x4_t) { lut[k[0]], lut[k[1]], lut[k[2]], lut[k[3]] };
+      l1 = (float32x4_t) { lut[k[0] + 1], lut[k[1] + 1], lut[k[2] + 1], lut[k[3] + 1] };
+      d = vfmaq_f32 (l0, vsubq_f32 (x, vcvtq_f32_u32 (kv)), vsubq_f32 (l1, l0));
+      d = vfmsq_f32 (d, r, vrndmq_f32 (vdivq_f32 (d, r)));
+      d = vbslq_f32 (vcgtq_f32 (d, zero), d, vdupq_n_f32 (1e-4f));
+    } else {
+      d = vdupq_n_f32 (1.0f);   /* valid marker only */
+    }
+    vst1q_f32 (self->dist + p, vbslq_f32 (invalid, zero, d));
+  }
+}
+#endif
+
 static void
 compute (GstTofDepth * self, const guint8 * data, gboolean want_depth)
 {
@@ -370,6 +460,12 @@ compute (GstTofDepth * self, const guint8 * data, gboolean want_depth)
     self->hist_pos = (self->hist_pos + 1) % navg;
   }
 
+#ifdef TOF_HAVE_NEON
+  if (use_simd) {
+    compute_neon (self, f0, f1, f2, f3, m, min_amp, navg, want_depth);
+    return;
+  }
+#endif
   for (guint p = 0; p < N_PIX; p++) {
     gint s0 = GINT16_FROM_LE (f0[p]), s1 = GINT16_FROM_LE (f1[p]);
     gint s2 = GINT16_FROM_LE (f2[p]), s3 = GINT16_FROM_LE (f3[p]);
@@ -520,6 +616,156 @@ fill_scalar (GstTofDepth * self, GstVideoFrame * vf, gboolean confidence)
   }
 }
 
+#ifdef TOF_HAVE_NEON
+G_STATIC_ASSERT (GST_TOF_WIDTH % 8 == 0);
+
+/* row writers shared by the NEON fills: grey value g (8 bit) in the output format */
+static inline void
+write_grey8_row (guint8 * row, const guint8 * g, GstVideoFormat fmt)
+{
+  switch (fmt) {
+    case GST_VIDEO_FORMAT_GRAY8:
+      memcpy (row, g, GST_TOF_WIDTH);
+      break;
+    case GST_VIDEO_FORMAT_RGBA:
+    case GST_VIDEO_FORMAT_BGRA:
+      for (guint x = 0; x < GST_TOF_WIDTH; x += 8) {
+        uint8x8_t v = vld1_u8 (g + x);
+        uint8x8x4_t px = { {v, v, v, vdup_n_u8 (255)} };
+        vst4_u8 (row + 4 * x, px);
+      }
+      break;
+    case GST_VIDEO_FORMAT_RGB:
+    case GST_VIDEO_FORMAT_BGR:
+      for (guint x = 0; x < GST_TOF_WIDTH; x += 8) {
+        uint8x8_t v = vld1_u8 (g + x);
+        uint8x8x3_t px = { {v, v, v} };
+        vst3_u8 (row + 3 * x, px);
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+/* fill_depth () with the per-pixel arithmetic vectorised and the format test out of the pixel loop */
+static void
+fill_depth_neon (GstTofDepth * self, GstVideoFrame * vf, guint mode)
+{
+  GstVideoFormat fmt = GST_VIDEO_FRAME_FORMAT (vf);
+  guint8 *base = GST_VIDEO_FRAME_PLANE_DATA (vf, 0);
+  gint stride = GST_VIDEO_FRAME_PLANE_STRIDE (vf, 0);
+  const float32x4_t zero = vdupq_n_f32 (0.0f);
+  gfloat lo, hi, span;
+  GstTofColormap cmap;
+  gint16 idx[GST_TOF_WIDTH];
+  guint8 g[GST_TOF_WIDTH];
+
+  GST_OBJECT_LOCK (self);
+  lo = (gfloat) self->min_distance;
+  hi = self->max_distance > 0.0 ? (gfloat) self->max_distance : (gfloat) self->models[mode].r;
+  cmap = self->colormap;
+  GST_OBJECT_UNLOCK (self);
+  span = hi > lo ? hi - lo : 1.0f;
+
+  for (guint y = 0; y < GST_TOF_HEIGHT; y++) {
+    guint8 *row = base + y * stride;
+    const gfloat *d = self->dist + y * GST_TOF_WIDTH;
+
+    if (fmt == GST_VIDEO_FORMAT_GRAY16_LE) {
+      /* mm, clamped to 1..65535; 0 = invalid */
+      for (guint x = 0; x < GST_TOF_WIDTH; x += 4) {
+        float32x4_t dv = vld1q_f32 (d + x);
+        int32x4_t mm = vmaxq_s32 (vcvtnq_s32_f32 (vmulq_f32 (dv, vdupq_n_f32 (1000.0f))), vdupq_n_s32 (1));
+        uint16x4_t v = vand_u16 (vqmovun_s32 (mm), vmovn_u32 (vcgtq_f32 (dv, zero)));
+
+        vst1_u16 ((guint16 *) (row + 2 * x), v);
+      }
+      continue;
+    }
+    /* colour index 0..255 (near = 255), -1 = invalid */
+    for (guint x = 0; x < GST_TOF_WIDTH; x += 4) {
+      float32x4_t dv = vld1q_f32 (d + x);
+      float32x4_t t = vmulq_f32 (vdupq_n_f32 (255.0f), vsubq_f32 (vdupq_n_f32 (1.0f),
+              vdivq_f32 (vsubq_f32 (dv, vdupq_n_f32 (lo)), vdupq_n_f32 (span))));
+      int32x4_t v = vminq_s32 (vmaxq_s32 (vcvtnq_s32_f32 (t), vdupq_n_s32 (0)), vdupq_n_s32 (255));
+
+      v = vbslq_s32 (vcgtq_f32 (dv, zero), v, vdupq_n_s32 (-1));
+      vst1_s16 (idx + x, vmovn_s32 (v));
+    }
+    if (fmt == GST_VIDEO_FORMAT_GRAY8 || cmap == GST_TOF_COLORMAP_GRAY) {
+      for (guint x = 0; x < GST_TOF_WIDTH; x++)
+        g[x] = idx[x] < 0 ? 0 : (guint8) idx[x];
+      write_grey8_row (row, g, fmt);
+    } else {
+      guint bpp = (fmt == GST_VIDEO_FORMAT_RGBA || fmt == GST_VIDEO_FORMAT_BGRA) ? 4 : 3;
+      gboolean bgr = fmt == GST_VIDEO_FORMAT_BGRA || fmt == GST_VIDEO_FORMAT_BGR;
+
+      for (guint x = 0; x < GST_TOF_WIDTH; x++) {
+        static const guint8 black[3] = { 0, 0, 0 };
+        const guint8 *c = idx[x] < 0 ? black : self->turbo[idx[x]];
+        guint8 *px = row + bpp * x;
+
+        px[0] = bgr ? c[2] : c[0];
+        px[1] = c[1];
+        px[2] = bgr ? c[0] : c[2];
+        if (bpp == 4)
+          px[3] = 255;
+      }
+    }
+  }
+}
+
+/* fill_scalar () vectorised: amplitude (counts or scaled to 8 bit) or confidence */
+static void
+fill_scalar_neon (GstTofDepth * self, GstVideoFrame * vf, gboolean confidence)
+{
+  GstVideoFormat fmt = GST_VIDEO_FRAME_FORMAT (vf);
+  guint8 *base = GST_VIDEO_FRAME_PLANE_DATA (vf, 0);
+  gint stride = GST_VIDEO_FRAME_PLANE_STRIDE (vf, 0);
+  const float32x4_t zero = vdupq_n_f32 (0.0f), one = vdupq_n_f32 (1.0f);
+  gboolean wide = fmt == GST_VIDEO_FORMAT_GRAY16_LE;
+  float32x4_t amax, cscale;
+  guint8 g[GST_TOF_WIDTH];
+
+  GST_OBJECT_LOCK (self);
+  amax = vdupq_n_f32 ((gfloat) self->amplitude_max);
+  cscale = vdupq_n_f32 ((gfloat) self->confidence_scale);
+  GST_OBJECT_UNLOCK (self);
+
+  for (guint y = 0; y < GST_TOF_HEIGHT; y++) {
+    guint8 *row = base + y * stride;
+    const gfloat *a = self->amp + y * GST_TOF_WIDTH, *d = self->dist + y * GST_TOF_WIDTH;
+
+    for (guint x = 0; x < GST_TOF_WIDTH; x += 4) {
+      float32x4_t av = vld1q_f32 (a + x);
+      uint32x4_t valid = vcgtq_f32 (vld1q_f32 (d + x), zero);
+      int32x4_t v;
+
+      if (confidence) {
+        float32x4_t c = vminq_f32 (one, vdivq_f32 (av, cscale));
+
+        v = vcvtnq_s32_f32 (vmulq_f32 (vdupq_n_f32 (wide ? 65535.0f : 255.0f), c));
+        v = vminq_s32 (vmaxq_s32 (v, vdupq_n_s32 (1)), vdupq_n_s32 (wide ? 65535 : 255));
+        v = vandq_s32 (v, vreinterpretq_s32_u32 (valid));
+      } else if (wide) {
+        v = vcvtnq_s32_f32 (av);        /* counts; vqmovun clamps to 0..65535 */
+      } else {
+        v = vcvtnq_s32_f32 (vdivq_f32 (vmulq_f32 (vdupq_n_f32 (255.0f), av), amax));
+        v = vminq_s32 (vmaxq_s32 (v, vdupq_n_s32 (0)), vdupq_n_s32 (255));
+      }
+      if (wide)
+        vst1_u16 ((guint16 *) (row + 2 * x), vqmovun_s32 (v));
+      else
+        vst1_lane_u32 ((guint32 *) (g + x), vreinterpret_u32_u8 (vqmovn_u16 (vcombine_u16 (vqmovun_s32 (v),
+                        vdup_n_u16 (0)))), 0);
+    }
+    if (!wide)
+      write_grey8_row (row, g, fmt);
+  }
+}
+#endif
+
 /* ---------------------------------------------------------------- negotiation and pools */
 
 static GstBufferPool *
@@ -650,6 +896,13 @@ push_output (GstTofDepth * self, TofOut * out, guint idx, guint mode, GstBuffer 
     GST_ELEMENT_ERROR (self, RESOURCE, WRITE, ("Cannot map an output buffer."), (NULL));
     return GST_FLOW_ERROR;
   }
+#ifdef TOF_HAVE_NEON
+  if (use_simd && idx == OUT_DEPTH)
+    fill_depth_neon (self, &vf, mode);
+  else if (use_simd)
+    fill_scalar_neon (self, &vf, idx == OUT_CONFIDENCE);
+  else
+#endif
   if (idx == OUT_DEPTH)
     fill_depth (self, &vf, mode);
   else
@@ -1082,6 +1335,10 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
   element_class->change_state = GST_DEBUG_FUNCPTR (gst_tof_depth_change_state);
 
   GST_DEBUG_CATEGORY_INIT (gst_tof_depth_debug, "qtitofdepth", 0, "Arducam ToF depth");
+#ifdef TOF_HAVE_NEON
+  use_simd = g_getenv ("GST_TOF_DEPTH_SCALAR") == NULL;
+  GST_INFO ("per-pixel path: %s", use_simd ? "NEON" : "scalar (GST_TOF_DEPTH_SCALAR)");
+#endif
 }
 
 static void
