@@ -35,6 +35,17 @@ target_include_directories(${GST_SAMPLE_APPS_UTILS} INTERFACE
 target_link_libraries(${GST_SAMPLE_APPS_UTILS} PRIVATE
   ${GST_LIBRARIES}
 )
+
+# In-tree builds: also expose the headers under their installed path gst/sampleapps/, so apps can
+# use the installed include form <gst/sampleapps/gst_sample_apps_utils.h> as well as the short one.
+set(GST_SAMPLE_APPS_STAGED_INCDIR ${CMAKE_CURRENT_BINARY_DIR}/include)
+foreach(header gst_sample_apps_utils.h gst_sample_apps_pipeline.h)
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/${header}
+    ${GST_SAMPLE_APPS_STAGED_INCDIR}/gst/sampleapps/${header} COPYONLY)
+endforeach()
+target_include_directories(${GST_SAMPLE_APPS_UTILS} INTERFACE
+  $<BUILD_INTERFACE:${GST_SAMPLE_APPS_STAGED_INCDIR}>
+)
 #LIBRARY DESTINATION /usr/lib/
 #PUBLIC_HEADER DESTINATION /usr/include/gstreamer-1.0/gst/apps/
 install(
