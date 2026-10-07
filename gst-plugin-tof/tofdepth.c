@@ -53,6 +53,11 @@ GST_DEBUG_CATEGORY_STATIC (gst_tof_depth_debug);
 #define DEFAULT_AMPLITUDE_MAX    255.0
 #define DEFAULT_CONFIDENCE_SCALE 64.0
 #define DEFAULT_TEMPORAL_AVERAGE 1
+#define DEFAULT_PROCESSING_LATENCY -1
+/* automatic processing latency: live p99 after the source push, NEON build, unpinned (arducam-tof-ventuno
+ * RUN-0064): ~6 ms with one output, ~9.3 ms for the third of three (max 11.2) */
+#define AUTO_LATENCY_BASE        (4 * GST_MSECOND)
+#define AUTO_LATENCY_PER_OUTPUT  (2500 * GST_USECOND)
 
 #define DEPTH_FORMATS "{ GRAY16_LE, RGBA, BGRA, RGB, BGR, GRAY8 }"
 /* RGB(A) variants replicate the grey value: qtivcomposer (GLES) shows GRAY8 as red only (RUN-0049) */
@@ -93,6 +98,7 @@ enum
   PROP_CONFIDENCE_SCALE,
   PROP_TEMPORAL_AVERAGE,
   PROP_DEPTH_TYPE,
+  PROP_PROCESSING_LATENCY,
   PROP_STATS,
 };
 
@@ -133,6 +139,7 @@ struct _GstTofDepth
   gdouble amplitude_max;
   gdouble confidence_scale;
   guint temporal_average;
+  gint64 processing_latency;    /* ns, -1 = automatic */
 
   /* stream state (streaming thread) */
   TofModel models[2];
@@ -1043,9 +1050,44 @@ gst_tof_depth_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
   }
 }
 
+/* time a group spends in this element before its output is pushed: the processing-latency property,
+ * or automatically from the number of linked outputs (they are computed and pushed one after the other) */
+static GstClockTime
+processing_latency (GstTofDepth * self)
+{
+  GstClockTime lat;
+  guint n = 0;
+
+  GST_OBJECT_LOCK (self);
+  if (self->processing_latency >= 0) {
+    lat = (GstClockTime) self->processing_latency;
+  } else {
+    for (guint k = 0; k < N_OUT; k++)
+      n += self->outs[k].pad && gst_pad_is_linked (self->outs[k].pad);
+    lat = AUTO_LATENCY_BASE + MAX (n, 1) * AUTO_LATENCY_PER_OUTPUT;
+  }
+  GST_OBJECT_UNLOCK (self);
+  return lat;
+}
+
 static gboolean
 gst_tof_depth_src_query (GstPad * pad, GstObject * parent, GstQuery * query)
 {
+  if (GST_QUERY_TYPE (query) == GST_QUERY_LATENCY) {
+    GstTofDepth *self = GST_TOF_DEPTH (parent);
+    GstClockTime min, max, lat;
+    gboolean live;
+
+    if (!gst_pad_peer_query (self->sinkpad, query))
+      return FALSE;
+    gst_query_parse_latency (query, &live, &min, &max);
+    lat = processing_latency (self);
+    GST_DEBUG_OBJECT (pad, "upstream live %d min %" GST_TIME_FORMAT " max %" GST_TIME_FORMAT
+        ", + processing %" GST_TIME_FORMAT, live, GST_TIME_ARGS (min), GST_TIME_ARGS (max),
+        GST_TIME_ARGS (lat));
+    gst_query_set_latency (query, live, min + lat, GST_CLOCK_TIME_IS_VALID (max) ? max + lat : max);
+    return TRUE;
+  }
   if (GST_QUERY_TYPE (query) == GST_QUERY_CAPS) {
     GstCaps *filter, *caps = gst_pad_get_pad_template_caps (pad);
 
@@ -1200,11 +1242,16 @@ gst_tof_depth_set_property (GObject * object, guint prop_id, const GValue * valu
       break;
     case PROP_DEPTH_TYPE:
       break;
+    case PROP_PROCESSING_LATENCY:
+      self->processing_latency = g_value_get_int64 (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
   }
   GST_OBJECT_UNLOCK (self);
+  if (prop_id == PROP_PROCESSING_LATENCY)
+    gst_element_post_message (GST_ELEMENT (self), gst_message_new_latency (GST_OBJECT (self)));
 }
 
 static void
@@ -1241,6 +1288,9 @@ gst_tof_depth_get_property (GObject * object, guint prop_id, GValue * value,
       break;
     case PROP_DEPTH_TYPE:
       g_value_set_enum (value, GST_TOF_DEPTH_RADIAL);
+      break;
+    case PROP_PROCESSING_LATENCY:
+      g_value_set_int64 (value, self->processing_latency);
       break;
     case PROP_STATS:
       g_value_take_boxed (value, gst_structure_new ("stats",
@@ -1318,6 +1368,11 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
   g_object_class_install_property (gobject_class, PROP_DEPTH_TYPE,
       g_param_spec_enum ("depth-type", "Depth type", "Distance definition of the depth output",
           gst_tof_depth_type_get_type (), GST_TOF_DEPTH_RADIAL, rw | GST_PARAM_MUTABLE_READY));
+  g_object_class_install_property (gobject_class, PROP_PROCESSING_LATENCY,
+      g_param_spec_int64 ("processing-latency", "Processing latency",
+          "Time (ns) from a group's arrival to its outputs, added to the latency query; -1 = automatic "
+          "(4 ms + 2.5 ms per linked output)", -1, GST_SECOND, DEFAULT_PROCESSING_LATENCY,
+          rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_STATS,
       g_param_spec_boxed ("stats", "Statistics", "groups, mean-process-us",
           GST_TYPE_STRUCTURE, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
@@ -1353,6 +1408,7 @@ gst_tof_depth_init (GstTofDepth * self)
   self->amplitude_max = DEFAULT_AMPLITUDE_MAX;
   self->confidence_scale = DEFAULT_CONFIDENCE_SCALE;
   self->temporal_average = DEFAULT_TEMPORAL_AVERAGE;
+  self->processing_latency = DEFAULT_PROCESSING_LATENCY;
   self->fps_n = 30;
   self->fps_d = 1;
   self->hist_mode = -1;

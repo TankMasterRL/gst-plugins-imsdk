@@ -49,6 +49,9 @@ GST_DEBUG_CATEGORY_STATIC (gst_tof_src_debug);
 #define RAW_LINE_BYTES        360
 #define GROUP_GAP_NS          (10 * GST_MSECOND)
 #define GROUP_DURATION        (GST_SECOND / 30)
+/* a group is complete 11.6 ms after its first frame (4-phase burst) and pushed <= 14.9 ms after it
+ * (arducam-tof-ventuno RUN-0058, RUN-0064): the min latency, not a whole group period */
+#define GROUP_LATENCY         (15 * GST_MSECOND)
 #define NO_FRAME_TIMEOUT      GST_SECOND
 #define FIRMWARE_IGNORES_EXPOSURE 0x10002
 
@@ -653,8 +656,7 @@ gst_tof_src_query (GstBaseSrc * basesrc, GstQuery * query)
   GstTofSrc *self = GST_TOF_SRC (basesrc);
 
   if (GST_QUERY_TYPE (query) == GST_QUERY_LATENCY) {
-    /* a group is complete one group period after its first frame starts */
-    GstClockTime min = GROUP_DURATION;
+    GstClockTime min = GROUP_LATENCY;
     GstClockTime max = min + self->n_v4l2_buffers * (GST_SECOND / 120);
 
     gst_query_set_latency (query, TRUE, min, max);
