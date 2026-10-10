@@ -53,6 +53,7 @@ GST_DEBUG_CATEGORY_STATIC (gst_tof_depth_debug);
 #define DEFAULT_AMPLITUDE_MAX    255.0
 #define DEFAULT_CONFIDENCE_SCALE 64.0
 #define DEFAULT_TEMPORAL_AVERAGE 1
+#define DEFAULT_FLYING_PIXEL_THRESHOLD 0.0
 #define DEFAULT_PROCESSING_LATENCY -1
 /* automatic processing latency: live p99 after the source push, NEON build, unpinned (arducam-tof-ventuno
  * RUN-0064): ~6 ms with one output, ~9.3 ms for the third of three (max 11.2) */
@@ -97,6 +98,7 @@ enum
   PROP_AMPLITUDE_MAX,
   PROP_CONFIDENCE_SCALE,
   PROP_TEMPORAL_AVERAGE,
+  PROP_FLYING_PIXEL_THRESHOLD,
   PROP_DEPTH_TYPE,
   PROP_PROCESSING_LATENCY,
   PROP_STATS,
@@ -140,6 +142,7 @@ struct _GstTofDepth
   gdouble amplitude_max;
   gdouble confidence_scale;
   guint temporal_average;
+  gdouble flying_pixel_threshold;  /* m, 0 = off */
   gint64 processing_latency;    /* ns, -1 = automatic */
 
   /* stream state (streaming thread) */
@@ -152,12 +155,14 @@ struct _GstTofDepth
   gfloat *dist;                 /* metres, 0 = invalid */
   gfloat *amp;
   gfloat *sum_i, *sum_q, *hist;
+  guint8 *flying;               /* flying-pixel mask of the current group */
   guint hist_count, hist_pos, hist_n;
   gint hist_mode;
 
   /* stats (object lock) */
   guint64 n_groups;
   guint64 proc_ns;
+  guint64 n_flying;
 };
 
 #define gst_tof_depth_parent_class parent_class
@@ -534,6 +539,43 @@ compute (GstTofDepth * self, const guint8 * data, gboolean want_depth)
       self->dist[p] = 1.0f;     /* valid marker only */
     }
   }
+}
+
+/* Flying pixels: on a depth edge a pixel sees foreground and background, and its mixed phasor gives a depth in
+ * between. A valid pixel whose depth lies strictly between both valid neighbours along a row, column or
+ * diagonal, with jumps above the threshold on both sides, becomes invalid; a true edge pixel has a similar
+ * neighbour on one side and stays. Decided on the unfiltered map, then cleared. */
+static guint
+remove_flying_pixels (GstTofDepth * self, gfloat thr)
+{
+  static const gint dx[4] = { 1, 0, 1, 1 }, dy[4] = { 0, 1, 1, -1 };
+  const gfloat *d = self->dist;
+  guint n = 0;
+
+  memset (self->flying, 0, N_PIX);
+  for (gint y = 1; y < GST_TOF_HEIGHT - 1; y++) {
+    for (gint x = 1; x < GST_TOF_WIDTH - 1; x++) {
+      gint p = y * GST_TOF_WIDTH + x;
+
+      if (d[p] <= 0.0f)
+        continue;
+      for (guint k = 0; k < 4; k++) {
+        gint o = dy[k] * GST_TOF_WIDTH + dx[k];
+        gfloat a = d[p - o], b = d[p + o];
+
+        if (a > 0.0f && b > 0.0f && ((a - d[p] > thr && d[p] - b > thr) ||
+                (b - d[p] > thr && d[p] - a > thr))) {
+          self->flying[p] = 1;
+          n++;
+          break;
+        }
+      }
+    }
+  }
+  for (guint p = 0; n > 0 && p < N_PIX; p++)
+    if (self->flying[p])
+      self->dist[p] = 0.0f;
+  return n;
 }
 
 static void
@@ -955,7 +997,8 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   GstFlowReturn ret = GST_FLOW_OK;
   GstMapInfo map;
   gboolean active[N_OUT];
-  guint mode;
+  guint mode, flying = 0;
+  gfloat flying_thr;
   guint64 t0 = g_get_monotonic_time ();
 
   if (!self->models_loaded && !load_models (self)) {
@@ -976,10 +1019,13 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   GST_OBJECT_LOCK (self);
   for (guint k = 0; k < N_OUT; k++)
     active[k] = self->outs[k].pad && gst_pad_is_linked (self->outs[k].pad);
+  flying_thr = (gfloat) self->flying_pixel_threshold;
   GST_OBJECT_UNLOCK (self);
 
   compute (self, map.data, active[OUT_DEPTH] || active[OUT_CONFIDENCE]);
   gst_buffer_unmap (inbuf, &map);
+  if (flying_thr > 0.0f && (active[OUT_DEPTH] || active[OUT_CONFIDENCE]))
+    flying = remove_flying_pixels (self, flying_thr);
 
   for (guint k = 0; k < N_OUT; k++) {
     GstFlowReturn r;
@@ -996,6 +1042,7 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
 
   GST_OBJECT_LOCK (self);
   self->n_groups++;
+  self->n_flying += flying;
   self->proc_ns += (g_get_monotonic_time () - t0) * 1000;
   GST_OBJECT_UNLOCK (self);
   gst_buffer_unref (inbuf);
@@ -1267,6 +1314,9 @@ gst_tof_depth_set_property (GObject * object, guint prop_id, const GValue * valu
     case PROP_TEMPORAL_AVERAGE:
       self->temporal_average = g_value_get_uint (value);
       break;
+    case PROP_FLYING_PIXEL_THRESHOLD:
+      self->flying_pixel_threshold = g_value_get_double (value);
+      break;
     case PROP_DEPTH_TYPE:
       break;
     case PROP_PROCESSING_LATENCY:
@@ -1313,6 +1363,9 @@ gst_tof_depth_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_TEMPORAL_AVERAGE:
       g_value_set_uint (value, self->temporal_average);
       break;
+    case PROP_FLYING_PIXEL_THRESHOLD:
+      g_value_set_double (value, self->flying_pixel_threshold);
+      break;
     case PROP_DEPTH_TYPE:
       g_value_set_enum (value, GST_TOF_DEPTH_RADIAL);
       break;
@@ -1323,6 +1376,7 @@ gst_tof_depth_get_property (GObject * object, guint prop_id, GValue * value,
       g_value_take_boxed (value, gst_structure_new ("stats",
               "groups", G_TYPE_UINT64, self->n_groups,
               "calibration", G_TYPE_STRING, self->calibration_used,
+              "flying-pixels", G_TYPE_UINT64, self->n_flying,
               "mean-process-us", G_TYPE_DOUBLE,
               self->n_groups ? self->proc_ns / 1000.0 / self->n_groups : 0.0, NULL));
       break;
@@ -1345,6 +1399,7 @@ gst_tof_depth_finalize (GObject * object)
   g_free (self->sum_i);
   g_free (self->sum_q);
   g_free (self->hist);
+  g_free (self->flying);
   gst_clear_event (&self->stream_start);
   gst_flow_combiner_free (self->combiner);
   G_OBJECT_CLASS (parent_class)->finalize (object);
@@ -1395,6 +1450,11 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
           "Average I/Q over a sliding window of N groups of the same mode (software substitute "
           "for exposure, DEC-0017)", 1, MAX_AVERAGE, DEFAULT_TEMPORAL_AVERAGE,
           rw | GST_PARAM_MUTABLE_PLAYING));
+  g_object_class_install_property (gobject_class, PROP_FLYING_PIXEL_THRESHOLD,
+      g_param_spec_double ("flying-pixel-threshold", "Flying-pixel threshold",
+          "Invalidate edge pixels whose depth lies between both neighbours along a row, column or diagonal "
+          "with a jump above this (m) on each side (mixed foreground/background); 0 = off", 0.0, 1.0,
+          DEFAULT_FLYING_PIXEL_THRESHOLD, rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_DEPTH_TYPE,
       g_param_spec_enum ("depth-type", "Depth type", "Distance definition of the depth output",
           gst_tof_depth_type_get_type (), GST_TOF_DEPTH_RADIAL, rw | GST_PARAM_MUTABLE_READY));
@@ -1404,7 +1464,7 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
           "(4 ms + 2.5 ms per linked output)", -1, GST_SECOND, DEFAULT_PROCESSING_LATENCY,
           rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_STATS,
-      g_param_spec_boxed ("stats", "Statistics", "groups, calibration (file in use, \"\" = none), mean-process-us",
+      g_param_spec_boxed ("stats", "Statistics", "groups, calibration (file in use, \"\" = none), flying-pixels (removed in all), mean-process-us",
           GST_TYPE_STRUCTURE, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_add_static_pad_template (element_class, &sink_template);
@@ -1438,6 +1498,7 @@ gst_tof_depth_init (GstTofDepth * self)
   self->amplitude_max = DEFAULT_AMPLITUDE_MAX;
   self->confidence_scale = DEFAULT_CONFIDENCE_SCALE;
   self->temporal_average = DEFAULT_TEMPORAL_AVERAGE;
+  self->flying_pixel_threshold = DEFAULT_FLYING_PIXEL_THRESHOLD;
   self->processing_latency = DEFAULT_PROCESSING_LATENCY;
   self->fps_n = 30;
   self->fps_d = 1;
@@ -1446,6 +1507,7 @@ gst_tof_depth_init (GstTofDepth * self)
   self->amp = g_new0 (gfloat, N_PIX);
   self->sum_i = g_new0 (gfloat, N_PIX);
   self->sum_q = g_new0 (gfloat, N_PIX);
+  self->flying = g_new0 (guint8, N_PIX);
   build_turbo (self->turbo);
   gst_segment_init (&self->segment, GST_FORMAT_TIME);
   self->combiner = gst_flow_combiner_new ();

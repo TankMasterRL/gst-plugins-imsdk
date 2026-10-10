@@ -10,6 +10,8 @@
  *                 uncalibrated (near) and with a pure-offset calibration key file (far)
  *   calibration   calibration unset: the default from GST_TOF_CALIBRATION is used; a missing default
  *                 makes READY -> PAUSED fail; the stats name the file in use (arducam-tof-ventuno DEC-0026)
+ *   flying-pixels a synthetic step 0.8 m | mixed column | 1.4 m: flying-pixel-threshold=0.05 clears exactly the
+ *                 mixed column, threshold 0 changes nothing (arducam-tof-ventuno RUN-0080)
  * The live cases need the Arducam ToF on CAMERA0 with the ToF boot entry and drivers loaded.
  */
 
@@ -371,6 +373,92 @@ GST_START_TEST (test_tof_calibration_default)
 }
 GST_END_TEST;
 
+/* Uncalibrated near mode (R 2 m, phi_ref 0): columns < 120 at 0.8 m, > 120 at 1.4 m, column 120 the mean of the
+ * two phasors (a flying pixel, ~1.1 m). Returns the GRAY16_LE depth (mm) and the stats' flying-pixels count. */
+static guint16 *
+depth_of_step (gdouble threshold, guint64 * flying)
+{
+  GstHarness *h = gst_harness_new_parse ("qtitofdepth calibration=\"\"");
+  GstBuffer *in = gst_buffer_new_allocate (NULL, TOF_SIZE, NULL), *out;
+  GstStructure *stats;
+  GstMapInfo map;
+  gint16 *f;
+  guint16 *depth = g_new (guint16, TOF_PIX);
+  const gdouble amp = 200.0, phi1 = -2.0 * G_PI * 0.8 / 2.0, phi2 = -2.0 * G_PI * 1.4 / 2.0;
+  GstElement *depth_el = gst_harness_find_element (h, "qtitofdepth");
+
+  fail_unless (depth_el != NULL);
+  g_object_set (depth_el, "flying-pixel-threshold", threshold, NULL);
+  gst_buffer_map (in, &map, GST_MAP_WRITE);
+  memset (map.data, 0, TOF_HDR);
+  GST_WRITE_UINT32_LE (map.data, TOF_MAGIC);
+  GST_WRITE_UINT16_LE (map.data + 4, TOF_HDR);
+  map.data[40] = map.data[41] = 1;
+  f = (gint16 *) (map.data + TOF_HDR);
+  for (guint p = 0; p < TOF_PIX; p++) {
+    guint x = p % TOF_W;
+    gdouble c, s;
+
+    if (x == TOF_W / 2) {
+      c = 0.5 * amp * (cos (phi1) + cos (phi2));
+      s = 0.5 * amp * (sin (phi1) + sin (phi2));
+    } else {
+      c = amp * cos (x < TOF_W / 2 ? phi1 : phi2);
+      s = amp * sin (x < TOF_W / 2 ? phi1 : phi2);
+    }
+    f[p] = GINT16_TO_LE ((gint16) lround (c));
+    f[TOF_PIX + p] = GINT16_TO_LE ((gint16) lround (s));
+    f[2 * TOF_PIX + p] = GINT16_TO_LE ((gint16) - lround (c));
+    f[3 * TOF_PIX + p] = GINT16_TO_LE ((gint16) - lround (s));
+  }
+  gst_buffer_unmap (in, &map);
+
+  gst_harness_set_src_caps_str (h, TOF_DCS_CAPS);
+  gst_harness_set_sink_caps_str (h,
+      "video/x-raw, format=(string)GRAY16_LE, width=(int)240, height=(int)180, framerate=(fraction)30/1");
+  fail_unless_equals_int (gst_harness_push (h, in), GST_FLOW_OK);
+  out = gst_harness_pull (h);
+  fail_unless (out != NULL);
+  gst_buffer_map (out, &map, GST_MAP_READ);
+  fail_unless (map.size >= TOF_PIX * 2);
+  for (guint p = 0; p < TOF_PIX; p++)
+    depth[p] = GST_READ_UINT16_LE (map.data + 2 * p);
+  gst_buffer_unmap (out, &map);
+  gst_buffer_unref (out);
+  g_object_get (depth_el, "stats", &stats, NULL);
+  fail_unless (gst_structure_get_uint64 (stats, "flying-pixels", flying));
+  gst_structure_free (stats);
+  gst_object_unref (depth_el);
+  gst_harness_teardown (h);
+  return depth;
+}
+
+GST_START_TEST (test_tof_flying_pixels)
+{
+  guint64 n_off = 0, n_on = 0;
+  guint16 *off = depth_of_step (0.0, &n_off), *on = depth_of_step (0.05, &n_on);
+
+  /* the step itself: 800 | ~1100 | 1400 mm without the filter */
+  fail_unless (ABS (off[90 * TOF_W + 60] - 800) <= 1, "left %u", off[90 * TOF_W + 60]);
+  fail_unless (ABS (off[90 * TOF_W + 180] - 1400) <= 1, "right %u", off[90 * TOF_W + 180]);
+  fail_unless (off[90 * TOF_W + 120] > 900 && off[90 * TOF_W + 120] < 1300, "mixed %u",
+      off[90 * TOF_W + 120]);
+  fail_unless_equals_uint64 (n_off, 0);
+  /* with the filter: the mixed column (inside the 1-pixel border) is invalid, nothing else changes */
+  for (guint p = 0; p < TOF_PIX; p++) {
+    guint x = p % TOF_W, y = p / TOF_W;
+
+    if (x == TOF_W / 2 && y > 0 && y < TOF_H - 1)
+      fail_unless (on[p] == 0, "mixed pixel %u,%u kept (%u)", x, y, on[p]);
+    else
+      fail_unless (on[p] == off[p], "pixel %u,%u changed %u -> %u", x, y, off[p], on[p]);
+  }
+  fail_unless_equals_uint64 (n_on, TOF_H - 2);
+  g_free (off);
+  g_free (on);
+}
+GST_END_TEST;
+
 static Suite *
 tof_suite (GList ** tcnames, gint iteration, gint duration)
 {
@@ -399,6 +487,12 @@ tof_suite (GList ** tcnames, gint iteration, gint duration)
   *tcnames = g_list_append (*tcnames, (gpointer) tcname);
   suite_add_tcase (s, tc);
   tcase_add_loop_test (tc, test_tof_calibration_default, start, end);
+
+  tcname = "flying-pixels";
+  tc = tcase_create (tcname);
+  *tcnames = g_list_append (*tcnames, (gpointer) tcname);
+  suite_add_tcase (s, tc);
+  tcase_add_loop_test (tc, test_tof_flying_pixels, start, end);
 
   tcname = "stream";
   tc = tcase_create (tcname);
