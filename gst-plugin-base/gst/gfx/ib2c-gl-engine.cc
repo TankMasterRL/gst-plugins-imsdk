@@ -1093,22 +1093,22 @@ std::vector<Surface> Engine::GetImageSurfaces(const Surface& surface,
 
     // Second sub-surface will represent the chroma info.
     if (surface.planes.size() == 2) {
+      // The format without the color space (BT.601 / BT.709) bits.
+      uint32_t format = Format::WithoutColorSpace(surface.format);
+
       subsurface.planes[0] = surface.planes[1];
       subsurface.size = surface.size - surface.planes[1].offset;
       subsurface.format = ColorFormat::kRG88;
 
-      if ((surface.format == ColorFormat::kNV21) ||
-          (surface.format == ColorFormat::kNV61))
+      if ((format == ColorFormat::kNV21) || (format == ColorFormat::kNV61))
         subsurface.format = ColorFormat::kGR88;
 
       // Depending on the surface format the chroma plane has different size.
-      if (surface.format == ColorFormat::kNV12 ||
-          surface.format == ColorFormat::kNV21 ||
-          surface.format == ColorFormat::kP010) {
+      if (format == ColorFormat::kNV12 || format == ColorFormat::kNV21 ||
+          format == ColorFormat::kP010) {
         subsurface.width /= 2;
         subsurface.height /= 2;
-      } else if (surface.format == ColorFormat::kNV16 ||
-                 surface.format == ColorFormat::kNV61) {
+      } else if (format == ColorFormat::kNV16 || format == ColorFormat::kNV61) {
         subsurface.width /= 2;
       }
 

@@ -304,6 +304,28 @@ gst_video_format_to_ib2c_format (GstVideoFormat format, const guint64 datatype)
   return -1;
 }
 
+static guint
+gst_video_colorimetry_to_ib2c_mode (const GstVideoColorimetry * colorimetry)
+{
+  // IB2C knows limited range BT.601 (its default when no mode is set) and
+  // BT.709, and full range BT.601.
+  switch (colorimetry->matrix) {
+    case GST_VIDEO_COLOR_MATRIX_BT601:
+      return (colorimetry->range == GST_VIDEO_COLOR_RANGE_0_255) ?
+          ::ib2c::ColorMode::kBT601FullRange : ::ib2c::ColorMode::kBT601;
+    case GST_VIDEO_COLOR_MATRIX_BT709:
+      if (colorimetry->range == GST_VIDEO_COLOR_RANGE_0_255)
+        GST_WARNING ("Full range BT.709 is not supported, using limited range!");
+
+      return ::ib2c::ColorMode::kBT709;
+    default:
+      GST_DEBUG ("Color matrix %d not supported, using BT.601 limited range",
+          colorimetry->matrix);
+  }
+
+  return 0;
+}
+
 static guint64
 gst_gles_create_surface (GstGlesVideoConverter * convert, const gchar * direction,
     GstBuffer * buffer, const GstVideoInfo * info, guint64 datatype)
@@ -380,6 +402,10 @@ gst_gles_create_surface (GstGlesVideoConverter * convert, const gchar * directio
   }
 
   surface.format = format;
+
+  // Color standard of YUV surfaces, used when rendering RGB into them.
+  if (GST_VIDEO_INFO_IS_YUV (info))
+    surface.format |= gst_video_colorimetry_to_ib2c_mode (&(info->colorimetry));
 
   n_planes = GST_VIDEO_INFO_N_PLANES (info);
   n_views = GST_VIDEO_INFO_VIEWS (info);

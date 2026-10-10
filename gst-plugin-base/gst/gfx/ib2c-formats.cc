@@ -502,6 +502,11 @@ uint32_t Format::ColorSpace(uint32_t format) {
   return (colorspace != 0) ? colorspace : ColorMode::kBT601;
 }
 
+uint32_t Format::WithoutColorSpace(uint32_t format) {
+
+  return format & ~kColorSpaceMask;
+}
+
 uint32_t Format::ToYuvColor(uint32_t color, uint32_t colorspace) {
 
   auto& coeffcients = kColorSpaceCoefficients.at(colorspace);

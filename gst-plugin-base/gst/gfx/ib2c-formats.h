@@ -49,6 +49,7 @@ class Format {
   static bool IsFloat(uint32_t format);
 
   static uint32_t ColorSpace(uint32_t format);
+  static uint32_t WithoutColorSpace(uint32_t format);
   static uint32_t ToYuvColor(uint32_t color, uint32_t colorspace);
 
  private:
