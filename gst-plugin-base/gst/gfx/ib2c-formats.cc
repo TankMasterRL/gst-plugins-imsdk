@@ -515,13 +515,23 @@ uint32_t Format::ToYuvColor(uint32_t color, uint32_t colorspace) {
   uint8_t blue = (color >> 8) & 0xFF;
   uint8_t alpha = color & 0xFF;
 
-  uint32_t y = (red * kr) + (green * kg) + (blue * kb);
-  uint32_t u = 128 + (red * (-(kr / (1.0 - kb)) / 2)) +
-      (green * (-(kg / (1.0 - kb)) / 2)) + (blue * 0.5);
-  uint32_t v = 128 + (red * 0.5) + (green * (-(kg / (1.0 - kr)) / 2)) +
-      (blue * (-(kb / (1.0 - kr)) / 2));
+  float y = (red * kr) + (green * kg) + (blue * kb);
+  float u = (blue - y) / (2.0 * (1.0 - kb));
+  float v = (red - y) / (2.0 * (1.0 - kr));
 
-  return (y << 24) + (u << 16) + (v << 8) + alpha;
+  // BT.601 and BT.709 are limited range: Y in 16 - 235, U and V in 16 - 240.
+  if (colorspace != ColorMode::kBT601FullRange) {
+    y = 16.0 + (y * 219.0 / 255.0);
+    u = u * 224.0 / 255.0;
+    v = v * 224.0 / 255.0;
+  }
+
+  auto to_byte = [](float value) -> uint32_t {
+    return (value <= 0.0) ? 0 : ((value >= 255.0) ? 255 : (value + 0.5));
+  };
+
+  return (to_byte(y) << 24) + (to_byte(128.0 + u) << 16) +
+      (to_byte(128.0 + v) << 8) + alpha;
 }
 
 } // namespace ib2c

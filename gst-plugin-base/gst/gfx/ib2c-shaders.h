@@ -181,16 +181,19 @@ void main() {
 
     float luminosity = 0.0;
 
+    // BT.601 and BT.709 are limited range (Y in 16 - 235 of 0 - 255).
     switch (colorSpace)
     {
         case (1 << 9):
             luminosity = 0.299 * source.r + 0.587 * source.g + 0.114 * source.b;
+            luminosity = (16.0 + 219.0 * luminosity) / 255.0;
             break;
         case (2 << 9):
             luminosity = 0.299 * source.r + 0.587 * source.g + 0.114 * source.b;
             break;
         case (3 << 9):
             luminosity = 0.2126 * source.r + 0.7152 * source.g + 0.0722 * source.b;
+            luminosity = (16.0 + 219.0 * luminosity) / 255.0;
             break;
     }
 
@@ -220,27 +223,35 @@ void main() {
     vec4 source = texture(extTex, texCoord);
     source = clamp(source, 0.0, 1.0);
 
-    float cr = 0.0;
     float cb = 0.0;
+    float cr = 0.0;
 
+    // Cb and Cr in -0.5 - 0.5 around 128, scaled to 16 - 240 of 0 - 255 for
+    // the limited range BT.601 and BT.709 and to 0 - 255 for full range.
     switch (colorSpace)
     {
         case (1 << 9):
-            cr = -0.147 * source.r - 0.289 * source.g + 0.436 * source.b + 0.5;
-            cb = 0.615 * source.r - 0.515 * source.g - 0.100 * source.b + 0.5;
+            cb = -0.168736 * source.r - 0.331264 * source.g + 0.500000 * source.b;
+            cr = 0.500000 * source.r - 0.418688 * source.g - 0.081312 * source.b;
+            cb = (128.0 + 224.0 * cb) / 255.0;
+            cr = (128.0 + 224.0 * cr) / 255.0;
             break;
         case (2 << 9):
-            cr = -0.169 * source.r - 0.331 * source.g + 0.500 * source.b + 0.5;
-            cb = 0.500 * source.r - 0.419 * source.g - 0.081 * source.b + 0.5;
+            cb = -0.168736 * source.r - 0.331264 * source.g + 0.500000 * source.b;
+            cr = 0.500000 * source.r - 0.418688 * source.g - 0.081312 * source.b;
+            cb = (128.0 + 255.0 * cb) / 255.0;
+            cr = (128.0 + 255.0 * cr) / 255.0;
             break;
         case (3 << 9):
-            cr = -0.1146 * source.r - 0.3854 * source.g + 0.5000 * source.b + 0.5;
-            cb = 0.5000 * source.r - 0.4542 * source.g - 0.0458 * source.b + 0.5;
+            cb = -0.114572 * source.r - 0.385428 * source.g + 0.500000 * source.b;
+            cr = 0.500000 * source.r - 0.454153 * source.g - 0.045847 * source.b;
+            cb = (128.0 + 224.0 * cb) / 255.0;
+            cr = (128.0 + 224.0 * cr) / 255.0;
             break;
     }
 
     float alpha = source.a * globalAlpha;
-    chromaColor = rbSwapped ? vec4(cb, cr, 0.0, alpha) : vec4(cr, cb, 0.0, alpha);
+    chromaColor = rbSwapped ? vec4(cr, cb, 0.0, alpha) : vec4(cb, cr, 0.0, alpha);
 }
 )";
 
