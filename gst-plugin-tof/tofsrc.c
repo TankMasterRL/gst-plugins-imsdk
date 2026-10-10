@@ -495,7 +495,8 @@ gst_tof_src_start (GstBaseSrc * basesrc)
   }
   close (media_fd);
 
-  /* controls on the sensor subdev; keeping it open keeps the module MCU powered (patch 0004) */
+  /* controls on the sensor subdev; the driver applies them at stream on (it powers the module only while
+   * streaming, arducam-tof-ventuno DEC-0030) */
   self->subdev_path = devnode_path (sensor.dev.major, sensor.dev.minor);
   GST_OBJECT_LOCK (self);
   self->subdev_fd = self->subdev_path ? open (self->subdev_path, O_RDWR | O_CLOEXEC) : -1;
