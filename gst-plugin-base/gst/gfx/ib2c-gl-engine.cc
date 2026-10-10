@@ -1031,6 +1031,20 @@ std::vector<GraphicTuple> Engine::ImportSurface(const Surface& surface,
       attribs[index++] = std::get<1>(internal) >> 32;
     }
 
+    // Color standard for sampling a YUV image as RGB. Without the hints the
+    // driver assumes BT.601 narrow range (the EGL_EXT_image_dma_buf_import
+    // default), which is also IB2C's default when no color space is set.
+    if (Format::IsYuv(subsurface.format)) {
+      uint32_t colorspace = Format::ColorSpace(subsurface.format);
+
+      attribs[index++] = EGL_YUV_COLOR_SPACE_HINT_EXT;
+      attribs[index++] = (colorspace == ColorMode::kBT709) ?
+          EGL_ITU_REC709_EXT : EGL_ITU_REC601_EXT;
+      attribs[index++] = EGL_SAMPLE_RANGE_HINT_EXT;
+      attribs[index++] = (colorspace == ColorMode::kBT601FullRange) ?
+          EGL_YUV_FULL_RANGE_EXT : EGL_YUV_NARROW_RANGE_EXT;
+    }
+
     attribs[index] = EGL_NONE;
 
     EGLImageKHR image =
