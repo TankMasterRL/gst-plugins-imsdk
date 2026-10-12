@@ -18,7 +18,9 @@
  * after the flying-pixel pass.
  *
  * Pads: "src" (always) depth, GRAY16_LE millimetres or a colour-mapped view; "amplitude" and
- * "confidence" (request). Outputs not linked are not computed. Invalid pixels (amplitude below
+ * "confidence" (request); "pointcloud" (request, RUN-0086): the QIM SDK tensor format
+ * (neural-network/tensors, FLOAT32, 1 x 180 x 240 x 3 + GstMLTensorMeta), per pixel X, Y, Z in metres
+ * (x right, y down, z forward) from the lens model, NaN = invalid. Outputs not linked are not computed. Invalid pixels (amplitude below
  * min-amplitude, or a DCS sample at the 11-bit rails) are 0. Output buffers come from the downstream
  * image pool or from a QIM image pool with the QTI DMA-buf allocator (videotransform.c pattern).
  */
@@ -42,6 +44,8 @@
 #include <gst/video/video.h>
 #include <gst/allocators/gstqtiallocator.h>
 #include <gst/video/gstimagepool.h>
+#include <gst/ml/ml-info.h>
+#include <gst/ml/gstmlmeta.h>
 
 GST_DEBUG_CATEGORY_STATIC (gst_tof_depth_debug);
 #define GST_CAT_DEFAULT gst_tof_depth_debug
@@ -90,8 +94,11 @@ enum
   OUT_DEPTH,
   OUT_AMPLITUDE,
   OUT_CONFIDENCE,
+  OUT_POINTCLOUD,
   N_OUT
 };
+
+#define POINTCLOUD_SIZE  (N_PIX * 3 * sizeof (gfloat))
 
 enum
 {
@@ -167,6 +174,8 @@ struct _GstTofDepth
   gfloat *sum_i, *sum_q, *hist;
   guint8 *flying;               /* flying-pixel mask of the current group */
   gfloat *zscale;               /* z / r per pixel, NULL = no lens loaded */
+  gfloat *rayx, *rayy;          /* undistorted normalised x, y per pixel (X = z x, Y = z y) */
+  gboolean dist_is_z;           /* dist of the current group already scaled to z */
   guint hist_count, hist_pos, hist_n;
   gint hist_mode;
 
@@ -368,7 +377,8 @@ load_calibration (GstTofDepth * self)
  * x = xd (1 + k1 rd^2 + k2 rd^4), xd = (u - cx) / f (likewise y); optional width/height must be the sensor's.
  * z / r = 1 / |(x, y, 1)| per pixel. */
 static gboolean
-lens_parse (GstTofDepth * self, GKeyFile * kf, const gchar * path, gfloat * zscale)
+lens_parse (GstTofDepth * self, GKeyFile * kf, const gchar * path, gfloat * zscale, gfloat * rayx,
+    gfloat * rayy)
 {
   GError *err = NULL;
   gdouble f, cx, cy, k1, k2 = 0.0;
@@ -401,6 +411,8 @@ lens_parse (GstTofDepth * self, GKeyFile * kf, const gchar * path, gfloat * zsca
       gdouble k = 1.0 + k1 * r2 + k2 * r2 * r2, x = xd * k, y = yd * k;
 
       zscale[v * GST_TOF_WIDTH + u] = (gfloat) (1.0 / sqrt (1.0 + x * x + y * y));
+      rayx[v * GST_TOF_WIDTH + u] = (gfloat) x;
+      rayy[v * GST_TOF_WIDTH + u] = (gfloat) y;
     }
   }
   GST_INFO_OBJECT (self, "lens %s: f %.3f, cx %.2f, cy %.2f, k1 %+.5f, k2 %+.5f; corner z/r %.5f", path, f, cx,
@@ -427,6 +439,8 @@ load_lens (GstTofDepth * self, const gchar * cal_path)
     path = cal_path && *cal_path ? g_strdup (cal_path) : NULL;
   }
   g_clear_pointer (&self->zscale, g_free);
+  g_clear_pointer (&self->rayx, g_free);
+  g_clear_pointer (&self->rayy, g_free);
   if (path) {
     GKeyFile *kf = g_key_file_new ();
     GError *err = NULL;
@@ -442,9 +456,13 @@ load_lens (GstTofDepth * self, const gchar * cal_path)
       g_clear_error (&err);
     } else if (g_key_file_has_group (kf, "lens")) {
       self->zscale = g_new (gfloat, N_PIX);
-      have = lens_parse (self, kf, path, self->zscale);
+      self->rayx = g_new (gfloat, N_PIX);
+      self->rayy = g_new (gfloat, N_PIX);
+      have = lens_parse (self, kf, path, self->zscale, self->rayx, self->rayy);
       if (!have) {
         g_clear_pointer (&self->zscale, g_free);
+        g_clear_pointer (&self->rayx, g_free);
+        g_clear_pointer (&self->rayy, g_free);
         if (explicit || type == GST_TOF_DEPTH_Z) {
           GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("Invalid lens model in %s.", path),
               ("[lens] needs f > 0, cx, cy, k1 (k2 optional); width/height, if given, %ux%u.", GST_TOF_WIDTH,
@@ -987,6 +1005,24 @@ fill_scalar_neon (GstTofDepth * self, GstVideoFrame * vf, gboolean confidence)
 }
 #endif
 
+/* X, Y, Z (m) per pixel, row-major, from the lens rays; NaN = invalid (organised point cloud) */
+static void
+fill_pointcloud (GstTofDepth * self, gfloat * out)
+{
+  for (guint p = 0; p < N_PIX; p++) {
+    gfloat d = self->dist[p], z;
+
+    if (d <= 0.0f) {
+      out[3 * p] = out[3 * p + 1] = out[3 * p + 2] = NAN;
+      continue;
+    }
+    z = self->dist_is_z ? d : d * self->zscale[p];
+    out[3 * p] = z * self->rayx[p];
+    out[3 * p + 1] = z * self->rayy[p];
+    out[3 * p + 2] = z;
+  }
+}
+
 /* ---------------------------------------------------------------- negotiation and pools */
 
 static GstBufferPool *
@@ -1034,6 +1070,34 @@ push_sticky (GstTofDepth * self, TofOut * out)
     g_free (id);
     gst_pad_push_event (out->pad, ev);
     out->need_stream_start = FALSE;
+  }
+  if (out->need_caps && out == &self->outs[OUT_POINTCLOUD]) {
+    /* fixed tensor caps (template + rate), a plain system-memory pool */
+    GstCaps *caps = gst_caps_make_writable (gst_pad_get_pad_template_caps (out->pad));
+    GstStructure *config;
+
+    gst_caps_set_simple (caps, "rate", GST_TYPE_FRACTION, self->fps_n, self->fps_d, NULL);
+    if (!gst_pad_push_event (out->pad, gst_event_new_caps (gst_caps_ref (caps)))) {
+      gst_caps_unref (caps);
+      GST_ELEMENT_ERROR (self, CORE, NEGOTIATION, ("Caps not accepted on %s.", GST_PAD_NAME (out->pad)),
+          (NULL));
+      return FALSE;
+    }
+    GST_INFO_OBJECT (out->pad, "caps %" GST_PTR_FORMAT, caps);
+    if (out->pool) {
+      gst_buffer_pool_set_active (out->pool, FALSE);
+      gst_clear_object (&out->pool);
+    }
+    out->pool = gst_buffer_pool_new ();
+    config = gst_buffer_pool_get_config (out->pool);
+    gst_buffer_pool_config_set_params (config, caps, POINTCLOUD_SIZE, 2, 0);
+    gst_caps_unref (caps);
+    if (!gst_buffer_pool_set_config (out->pool, config) || !gst_buffer_pool_set_active (out->pool, TRUE)) {
+      GST_ELEMENT_ERROR (self, RESOURCE, NO_SPACE_LEFT, ("Cannot activate the buffer pool of %s.",
+              GST_PAD_NAME (out->pad)), (NULL));
+      return FALSE;
+    }
+    out->need_caps = FALSE;
   }
   if (out->need_caps) {
     GstCaps *tmpl = gst_pad_get_pad_template_caps (out->pad), *peer, *caps;
@@ -1112,6 +1176,26 @@ push_output (GstTofDepth * self, TofOut * out, guint idx, guint mode, GstBuffer 
   ret = gst_buffer_pool_acquire_buffer (out->pool, &buf, NULL);
   if (ret != GST_FLOW_OK)
     return ret;
+  if (idx == OUT_POINTCLOUD) {
+    static const guint dims[GST_ML_TENSOR_MAX_DIMS] = { 1, GST_TOF_HEIGHT, GST_TOF_WIDTH, 3 };
+    GstMLTensorMeta *meta;
+    GstMapInfo map;
+
+    if (!gst_buffer_map (buf, &map, GST_MAP_WRITE)) {
+      gst_buffer_unref (buf);
+      GST_ELEMENT_ERROR (self, RESOURCE, WRITE, ("Cannot map an output buffer."), (NULL));
+      return GST_FLOW_ERROR;
+    }
+    fill_pointcloud (self, (gfloat *) map.data);
+    gst_buffer_unmap (buf, &map);
+    meta = gst_buffer_add_ml_tensor_meta (buf, GST_ML_TYPE_FLOAT32, 4, dims);
+    if (meta) {
+      meta->id = 0;
+      meta->name = g_quark_from_static_string ("pointcloud");
+    }
+    gst_buffer_copy_into (buf, inbuf, GST_BUFFER_COPY_TIMESTAMPS | GST_BUFFER_COPY_FLAGS, 0, -1);
+    return gst_pad_push (out->pad, buf);
+  }
   if (!gst_video_frame_map (&vf, &out->info, buf, GST_MAP_WRITE)) {
     gst_buffer_unref (buf);
     GST_ELEMENT_ERROR (self, RESOURCE, WRITE, ("Cannot map an output buffer."), (NULL));
@@ -1169,12 +1253,20 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   to_z = self->depth_type == GST_TOF_DEPTH_Z && self->zscale;
   GST_OBJECT_UNLOCK (self);
 
-  compute (self, map.data, active[OUT_DEPTH] || active[OUT_CONFIDENCE]);
+  if (active[OUT_POINTCLOUD] && !self->zscale) {
+    gst_buffer_unmap (inbuf, &map);
+    GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("The pointcloud output needs a lens model."),
+        ("Set lens= to a key file with a [lens] group, or add that group to the calibration file."));
+    gst_buffer_unref (inbuf);
+    return GST_FLOW_ERROR;
+  }
+  compute (self, map.data, active[OUT_DEPTH] || active[OUT_CONFIDENCE] || active[OUT_POINTCLOUD]);
   gst_buffer_unmap (inbuf, &map);
-  if (flying_thr > 0.0f && (active[OUT_DEPTH] || active[OUT_CONFIDENCE]))
+  if (flying_thr > 0.0f && (active[OUT_DEPTH] || active[OUT_CONFIDENCE] || active[OUT_POINTCLOUD]))
     flying = remove_flying_pixels (self, flying_thr);
   /* the flying-pixel test judged the measured (radial) distance; 0 = invalid stays 0 */
-  if (to_z && active[OUT_DEPTH])
+  self->dist_is_z = to_z && active[OUT_DEPTH];
+  if (self->dist_is_z)
     for (guint p = 0; p < N_PIX; p++)
       self->dist[p] *= self->zscale[p];
 
@@ -1188,7 +1280,7 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
     if (ret != GST_FLOW_OK && ret != GST_FLOW_NOT_LINKED)
       break;
   }
-  if (!active[OUT_DEPTH] && !active[OUT_AMPLITUDE] && !active[OUT_CONFIDENCE])
+  if (!active[OUT_DEPTH] && !active[OUT_AMPLITUDE] && !active[OUT_CONFIDENCE] && !active[OUT_POINTCLOUD])
     ret = GST_FLOW_NOT_LINKED;
 
   GST_OBJECT_LOCK (self);
@@ -1360,7 +1452,8 @@ gst_tof_depth_request_new_pad (GstElement * element, GstPadTemplate * templ,
 {
   GstTofDepth *self = GST_TOF_DEPTH (element);
   const gchar *tname = GST_PAD_TEMPLATE_NAME_TEMPLATE (templ);
-  guint idx = g_strcmp0 (tname, "amplitude") == 0 ? OUT_AMPLITUDE : OUT_CONFIDENCE;
+  guint idx = g_strcmp0 (tname, "amplitude") == 0 ? OUT_AMPLITUDE :
+      g_strcmp0 (tname, "pointcloud") == 0 ? OUT_POINTCLOUD : OUT_CONFIDENCE;
   GstPad *pad;
 
   GST_OBJECT_LOCK (self);
@@ -1409,6 +1502,11 @@ gst_tof_depth_change_state (GstElement * element, GstStateChange transition)
   if (transition == GST_STATE_CHANGE_READY_TO_PAUSED) {
     if (!load_models (self))
       return GST_STATE_CHANGE_FAILURE;
+    if (self->outs[OUT_POINTCLOUD].pad && !self->zscale) {
+      GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("The pointcloud output needs a lens model."),
+          ("Set lens= to a key file with a [lens] group, or add that group to the calibration file."));
+      return GST_STATE_CHANGE_FAILURE;
+    }
     gst_segment_init (&self->segment, GST_FORMAT_TIME);
     gst_flow_combiner_reset (self->combiner);
     self->hist_count = self->hist_pos = 0;
@@ -1560,6 +1658,8 @@ gst_tof_depth_finalize (GObject * object)
   g_free (self->lens);
   g_free (self->lens_used);
   g_free (self->zscale);
+  g_free (self->rayx);
+  g_free (self->rayy);
   g_free (self->dist);
   g_free (self->amp);
   g_free (self->sum_i);
@@ -1644,6 +1744,25 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
   gst_element_class_add_static_pad_template (element_class, &depth_template);
   gst_element_class_add_static_pad_template (element_class, &amplitude_template);
   gst_element_class_add_static_pad_template (element_class, &confidence_template);
+  {
+    /* the QIM SDK tensor format, built as its ML elements do (gst_ml_info_to_caps) + rate */
+    GstMLInfo info;
+    GstCaps *caps;
+
+    gst_ml_info_init (&info);
+    info.type = GST_ML_TYPE_FLOAT32;
+    info.n_tensors = 1;
+    info.n_dimensions[0] = 4;
+    info.tensors[0][0] = 1;
+    info.tensors[0][1] = GST_TOF_HEIGHT;
+    info.tensors[0][2] = GST_TOF_WIDTH;
+    info.tensors[0][3] = 3;
+    caps = gst_ml_info_to_caps (&info);
+    gst_caps_set_simple (caps, "rate", GST_TYPE_FRACTION_RANGE, 0, 1, 1000, 1, NULL);
+    gst_element_class_add_pad_template (element_class,
+        gst_pad_template_new ("pointcloud", GST_PAD_SRC, GST_PAD_REQUEST, caps));
+    gst_caps_unref (caps);
+  }
   gst_element_class_set_static_metadata (element_class, "Arducam ToF depth",
       "Filter/Converter/Video", "Calibrated depth, amplitude and confidence from groups of "
       "4 DCS frames (qtitofsrc)", "arducam-tof-ventuno project");

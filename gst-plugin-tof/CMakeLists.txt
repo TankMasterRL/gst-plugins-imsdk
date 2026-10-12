@@ -20,6 +20,9 @@ pkg_check_modules(GST_QCOM_VIDEO
   REQUIRED gstreamer-qcom-oss-video-1.0>=1.0.0)
 pkg_check_modules(GST_QCOM_ALLOC
   REQUIRED gstreamer-qcom-oss-allocators-1.0>=1.0.0)
+# qtitofdepth "pointcloud": the QIM SDK tensor caps and GstMLTensorMeta (arducam-tof-ventuno RUN-0086)
+pkg_check_modules(GST_QCOM_ML
+  REQUIRED gstreamer-qcom-oss-ml-1.0>=1.0.0)
 
 # qtitofdepth: calibration used when the property is unset (installed by gstreamer1.0-qtitof, arducam-tof-ventuno DEC-0026)
 set(TOF_DEFAULT_CALIBRATION "/usr/share/arducam-tof/tof-depth-cal-v1.conf"
@@ -51,6 +54,7 @@ target_include_directories(${GST_QTI_TOF} PUBLIC
   ${GST_VIDEO_INCLUDE_DIRS}
   ${GST_QCOM_VIDEO_INCLUDE_DIRS}
   ${GST_QCOM_ALLOC_INCLUDE_DIRS}
+  ${GST_QCOM_ML_INCLUDE_DIRS}
 )
 
 target_link_libraries(${GST_QTI_TOF} PRIVATE
@@ -60,6 +64,7 @@ target_link_libraries(${GST_QTI_TOF} PRIVATE
   ${GST_VIDEO_LIBRARIES}
   ${GST_QCOM_VIDEO_LIBRARIES}
   ${GST_QCOM_ALLOC_LIBRARIES}
+  ${GST_QCOM_ML_LIBRARIES}
   m
 )
 

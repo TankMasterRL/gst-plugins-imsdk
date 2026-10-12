@@ -15,6 +15,10 @@
  *   depth-z       depth-type=z with a test lens on a constant-distance group: every pixel = r / |(x, y, 1)| of the
  *                 lens within 1 mm; radial unchanged with a lens set; the calibration's [lens] group is used when
  *                 lens is unset; z without a lens, or with an unusable one, fails to start (arducam-tof-ventuno RUN-0085)
+ *   pointcloud    the "pointcloud" pad with a test lens on a constant-distance group with an invalid band: caps parse as
+ *                 a FLOAT32 1x180x240x3 tensor (gst_ml_info_from_caps), a tensor meta, every valid point within 0.1 mm
+ *                 of r (x, y, 1) / |(x, y, 1)|, invalid points NaN, the same with depth-type=z; no lens -> no start
+ *                 (arducam-tof-ventuno RUN-0086)
  * The live cases need the Arducam ToF on CAMERA0 with the ToF boot entry and drivers loaded.
  */
 
@@ -24,6 +28,8 @@
 #include <glib/gstdio.h>
 
 #include "plugin-suite.h"
+#include <gst/ml/ml-info.h>
+#include <gst/ml/gstmlmeta.h>
 
 #define TOF_W          240
 #define TOF_H          180
@@ -613,6 +619,125 @@ GST_START_TEST (test_tof_depth_z)
 }
 GST_END_TEST;
 
+/* point cloud (X, Y, Z per pixel, m) of one uncalibrated near-mode group: every pixel at d metres, rows < 10 invalid
+ * (I = Q = 0); checks caps and meta; returns the floats and the element's radial distance of the valid pixels */
+static gfloat *
+pointcloud_of_constant (const gchar * props, gdouble d, gdouble * r_out)
+{
+  gchar *launch = g_strdup_printf ("qtitofdepth calibration=\"\" %s", props);
+  GstElement *e = gst_parse_launch (launch, NULL);
+  GstHarness *h;
+  GstBuffer *in = gst_buffer_new_allocate (NULL, TOF_SIZE, NULL), *out;
+  GstMapInfo map;
+  GstMLInfo info;
+  GstMLTensorMeta *meta;
+  GstCaps *caps;
+  gint16 *f;
+  gfloat *pts = g_new (gfloat, TOF_PIX * 3);
+  const gdouble phi = -2.0 * G_PI * d / 2.0;
+  const gint16 c = (gint16) lround (200.0 * cos (phi)), s = (gint16) lround (200.0 * sin (phi));
+  gdouble u = -atan2 (2.0 * s, 2.0 * c);
+
+  fail_unless (e != NULL);
+  h = gst_harness_new_with_element (e, "sink", "pointcloud");
+  gst_buffer_map (in, &map, GST_MAP_WRITE);
+  memset (map.data, 0, TOF_HDR);
+  GST_WRITE_UINT32_LE (map.data, TOF_MAGIC);
+  GST_WRITE_UINT16_LE (map.data + 4, TOF_HDR);
+  map.data[40] = map.data[41] = 1;
+  f = (gint16 *) (map.data + TOF_HDR);
+  for (guint p = 0; p < TOF_PIX; p++) {
+    gboolean bad = p / TOF_W < 10;
+
+    f[p] = GINT16_TO_LE (bad ? 0 : c);
+    f[TOF_PIX + p] = GINT16_TO_LE (bad ? 0 : s);
+    f[2 * TOF_PIX + p] = GINT16_TO_LE (bad ? 0 : (gint16) - c);
+    f[3 * TOF_PIX + p] = GINT16_TO_LE (bad ? 0 : (gint16) - s);
+  }
+  gst_buffer_unmap (in, &map);
+  gst_harness_set_src_caps_str (h, TOF_DCS_CAPS);
+  fail_unless_equals_int (gst_harness_push (h, in), GST_FLOW_OK);
+  out = gst_harness_pull (h);
+  fail_unless (out != NULL);
+
+  caps = gst_pad_get_current_caps (h->sinkpad);
+  fail_unless (caps != NULL);
+  fail_unless (gst_ml_info_from_caps (&info, caps), "caps %" GST_PTR_FORMAT, caps);
+  fail_unless (GST_ML_INFO_TYPE (&info) == GST_ML_TYPE_FLOAT32 && GST_ML_INFO_N_TENSORS (&info) == 1 &&
+      GST_ML_INFO_N_DIMENSIONS (&info, 0) == 4 && GST_ML_INFO_TENSOR_DIM (&info, 0, 0) == 1 &&
+      GST_ML_INFO_TENSOR_DIM (&info, 0, 1) == TOF_H && GST_ML_INFO_TENSOR_DIM (&info, 0, 2) == TOF_W &&
+      GST_ML_INFO_TENSOR_DIM (&info, 0, 3) == 3, "caps %" GST_PTR_FORMAT, caps);
+  fail_unless_equals_uint64 (gst_ml_info_size (&info), TOF_PIX * 3 * sizeof (gfloat));
+  gst_caps_unref (caps);
+  meta = gst_buffer_get_ml_tensor_meta (out);
+  fail_unless (meta != NULL);
+  fail_unless (meta->type == GST_ML_TYPE_FLOAT32 && meta->n_dimensions == 4 && meta->dimensions[1] == TOF_H &&
+      meta->dimensions[2] == TOF_W && meta->dimensions[3] == 3);
+  fail_unless_equals_string (g_quark_to_string (meta->name), "pointcloud");
+
+  gst_buffer_map (out, &map, GST_MAP_READ);
+  fail_unless_equals_uint64 (map.size, TOF_PIX * 3 * sizeof (gfloat));
+  memcpy (pts, map.data, map.size);
+  gst_buffer_unmap (out, &map);
+  gst_buffer_unref (out);
+  gst_harness_teardown (h);
+  g_free (launch);
+  u -= 2.0 * G_PI * floor (u / (2.0 * G_PI));
+  *r_out = 2.0 * u / (2.0 * G_PI);      /* R = 2 m, phi_ref 0: the distance of the rounded I/Q */
+  return pts;
+}
+
+GST_START_TEST (test_tof_pointcloud)
+{
+  const gdouble f = 200.0, cx = 119.5, cy = 89.5, k1 = 0.1;
+  gchar *lens = write_tmp ("[lens]\nf=200\ncx=119.5\ncy=89.5\nk1=0.1\n");
+  gchar *props;
+  gfloat *pts[2];
+  gdouble r = 0.0, worst = 0.0;
+  GstElement *e;
+
+  props = g_strdup_printf ("lens=%s", lens);
+  pts[0] = pointcloud_of_constant (props, 1.2, &r);
+  g_free (props);
+  props = g_strdup_printf ("depth-type=z lens=%s", lens);
+  pts[1] = pointcloud_of_constant (props, 1.2, &r);
+  g_free (props);
+  fail_unless (fabs (r - 1.2) < 0.002, "r %f", r);
+  for (guint k = 0; k < 2; k++) {
+    for (guint p = 0; p < TOF_PIX; p++) {
+      guint uu = p % TOF_W, vv = p / TOF_W;
+      gdouble xd = (uu - cx) / f, yd = (vv - cy) / f, r2 = xd * xd + yd * yd, s = 1.0 + k1 * r2;
+      gdouble x = xd * s, y = yd * s, n = sqrt (1.0 + x * x + y * y);
+      const gfloat *q = pts[k] + 3 * p;
+
+      if (vv < 10) {
+        fail_unless (isnan (q[0]) && isnan (q[1]) && isnan (q[2]), "invalid pixel %u,%u not NaN", uu, vv);
+        continue;
+      }
+      worst = MAX (worst, fabs (q[0] - r * x / n));
+      worst = MAX (worst, fabs (q[1] - r * y / n));
+      worst = MAX (worst, fabs (q[2] - r / n));
+    }
+  }
+  fail_unless (worst < 1e-4, "max point error %.6f m", worst);
+  /* corner (0, 10) is up-left: x < 0, y < 0 */
+  fail_unless (pts[0][3 * (10 * TOF_W)] < 0.0f && pts[0][3 * (10 * TOF_W) + 1] < 0.0f);
+
+  /* no lens: the pad cannot stream */
+  e = gst_element_factory_make ("qtitofdepth", NULL);
+  g_object_set (e, "calibration", "", NULL);
+  fail_unless (gst_element_request_pad_simple (e, "pointcloud") != NULL);
+  fail_unless_equals_int (gst_element_set_state (e, GST_STATE_PAUSED), GST_STATE_CHANGE_FAILURE);
+  gst_element_set_state (e, GST_STATE_NULL);
+  gst_object_unref (e);
+
+  g_free (pts[0]);
+  g_free (pts[1]);
+  g_unlink (lens);
+  g_free (lens);
+}
+GST_END_TEST;
+
 static Suite *
 tof_suite (GList ** tcnames, gint iteration, gint duration)
 {
@@ -653,6 +778,12 @@ tof_suite (GList ** tcnames, gint iteration, gint duration)
   *tcnames = g_list_append (*tcnames, (gpointer) tcname);
   suite_add_tcase (s, tc);
   tcase_add_loop_test (tc, test_tof_depth_z, start, end);
+
+  tcname = "pointcloud";
+  tc = tcase_create (tcname);
+  *tcnames = g_list_append (*tcnames, (gpointer) tcname);
+  suite_add_tcase (s, tc);
+  tcase_add_loop_test (tc, test_tof_pointcloud, start, end);
 
   tcname = "stream";
   tc = tcase_create (tcname);

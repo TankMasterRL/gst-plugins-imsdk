@@ -16,6 +16,9 @@ pkg_check_modules(GST_VIDEO
   REQUIRED gstreamer-video-1.0>=${GST_VERSION_REQUIRED})
 pkg_check_modules(GST_PBUTILS
   REQUIRED gstreamer-pbutils-1.0>=${GST_VERSION_REQUIRED})
+# suite-tof "pointcloud": parse the tensor caps and meta with the QIM ML base library
+pkg_check_modules(GST_QCOM_ML
+  REQUIRED gstreamer-qcom-oss-ml-1.0>=1.0.0)
 
 include_directories(utils)
 
@@ -32,6 +35,7 @@ add_executable(${GST_TEST_FRAMEWORK}
 target_include_directories(${GST_TEST_FRAMEWORK} PRIVATE
   ${GST_INCLUDE_DIRS}
   ${GST_CHECK_INCLUDE_DIRS}
+  ${GST_QCOM_ML_INCLUDE_DIRS}
 )
 
 target_link_libraries(${GST_TEST_FRAMEWORK} PRIVATE
@@ -39,6 +43,7 @@ target_link_libraries(${GST_TEST_FRAMEWORK} PRIVATE
   ${GST_CHECK_LIBRARIES}
   ${GST_PBUTILS_LIBRARIES}
   ${GST_VIDEO_LIBRARIES}
+  ${GST_QCOM_ML_LIBRARIES}
   m
 )
 
