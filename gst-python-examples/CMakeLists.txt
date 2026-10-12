@@ -19,6 +19,7 @@ set(PYTHON_SCRIPTS
   gst-parallel-inference.py
   gst-rtspsrc-detection-display.py
   gst-tof-depth.py
+  gst-tof-pointcloud.py
 )
 
 set(QDEMO_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/files")
