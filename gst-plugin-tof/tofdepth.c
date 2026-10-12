@@ -12,6 +12,11 @@
  * so the equation is solved once per mode at load time (fixed-point iteration, as tof-sweep.py) into a
  * table over u; a pixel costs one atan2 and one interpolated lookup.
  *
+ * depth-type=z (arducam-tof-ventuno RUN-0085): z = r / |(x, y, 1)| with (x, y) the undistorted normalised
+ * coordinates of the pixel, from a lens model (key-file group [lens]: f, cx, cy, k1, k2 - the model of
+ * tools/tof-lens.py) in the lens= file or the calibration file; a per-pixel table built at load time, applied
+ * after the flying-pixel pass.
+ *
  * Pads: "src" (always) depth, GRAY16_LE millimetres or a colour-mapped view; "amplitude" and
  * "confidence" (request). Outputs not linked are not computed. Invalid pixels (amplitude below
  * min-amplitude, or a DCS sample at the 11-bit rails) are 0. Output buffers come from the downstream
@@ -77,6 +82,7 @@ typedef enum
 typedef enum
 {
   GST_TOF_DEPTH_RADIAL,
+  GST_TOF_DEPTH_Z,
 } GstTofDepthType;
 
 enum
@@ -100,6 +106,7 @@ enum
   PROP_TEMPORAL_AVERAGE,
   PROP_FLYING_PIXEL_THRESHOLD,
   PROP_DEPTH_TYPE,
+  PROP_LENS,
   PROP_PROCESSING_LATENCY,
   PROP_STATS,
 };
@@ -143,6 +150,9 @@ struct _GstTofDepth
   gdouble confidence_scale;
   guint temporal_average;
   gdouble flying_pixel_threshold;  /* m, 0 = off */
+  GstTofDepthType depth_type;
+  gchar *lens;                  /* key file with [lens], NULL = the calibration's [lens] group if any */
+  gchar *lens_used;             /* file in use, NULL = no lens (stats) */
   gint64 processing_latency;    /* ns, -1 = automatic */
 
   /* stream state (streaming thread) */
@@ -156,6 +166,7 @@ struct _GstTofDepth
   gfloat *amp;
   gfloat *sum_i, *sum_q, *hist;
   guint8 *flying;               /* flying-pixel mask of the current group */
+  gfloat *zscale;               /* z / r per pixel, NULL = no lens loaded */
   guint hist_count, hist_pos, hist_n;
   gint hist_mode;
 
@@ -204,8 +215,9 @@ gst_tof_depth_type_get_type (void)
 {
   static gsize type = 0;
   static const GEnumValue values[] = {
-    { GST_TOF_DEPTH_RADIAL, "Radial distance along each pixel's ray (z needs the lens model, T6.1)",
-        "radial" },
+    { GST_TOF_DEPTH_RADIAL, "Radial distance along each pixel's ray (as calibrated)", "radial" },
+    { GST_TOF_DEPTH_Z, "Distance along the optical axis (needs a lens model: lens= or the calibration's "
+          "[lens] group)", "z" },
     { 0, NULL, NULL },
   };
 
@@ -291,7 +303,7 @@ model_load (GstTofDepth * self, GKeyFile * kf, const gchar * group, TofModel * m
 }
 
 static gboolean
-load_models (GstTofDepth * self)
+load_calibration (GstTofDepth * self)
 {
   GKeyFile *kf;
   GError *err = NULL;
@@ -349,6 +361,139 @@ load_models (GstTofDepth * self)
   GST_OBJECT_UNLOCK (self);
   if (!ok)
     g_free (path);
+  return ok;
+}
+
+/* Lens model [lens]: f, cx, cy (pixels; u, v = 0-based pixel centres), k1, k2 of the inverse radial model
+ * x = xd (1 + k1 rd^2 + k2 rd^4), xd = (u - cx) / f (likewise y); optional width/height must be the sensor's.
+ * z / r = 1 / |(x, y, 1)| per pixel. */
+static gboolean
+lens_parse (GstTofDepth * self, GKeyFile * kf, const gchar * path, gfloat * zscale)
+{
+  GError *err = NULL;
+  gdouble f, cx, cy, k1, k2 = 0.0;
+
+  f = g_key_file_get_double (kf, "lens", "f", &err);
+  if (!err)
+    cx = g_key_file_get_double (kf, "lens", "cx", &err);
+  if (!err)
+    cy = g_key_file_get_double (kf, "lens", "cy", &err);
+  if (!err)
+    k1 = g_key_file_get_double (kf, "lens", "k1", &err);
+  if (!err && g_key_file_has_key (kf, "lens", "k2", NULL))
+    k2 = g_key_file_get_double (kf, "lens", "k2", &err);
+  if (err) {
+    GST_ERROR_OBJECT (self, "lens %s: %s", path, err->message);
+    g_error_free (err);
+    return FALSE;
+  }
+  if (!(f > 0.0) || (g_key_file_has_key (kf, "lens", "width", NULL) &&
+          g_key_file_get_integer (kf, "lens", "width", NULL) != GST_TOF_WIDTH) ||
+      (g_key_file_has_key (kf, "lens", "height", NULL) &&
+          g_key_file_get_integer (kf, "lens", "height", NULL) != GST_TOF_HEIGHT)) {
+    GST_ERROR_OBJECT (self, "lens %s: f must be > 0 and width x height %ux%u", path, GST_TOF_WIDTH,
+        GST_TOF_HEIGHT);
+    return FALSE;
+  }
+  for (guint v = 0; v < GST_TOF_HEIGHT; v++) {
+    for (guint u = 0; u < GST_TOF_WIDTH; u++) {
+      gdouble xd = (u - cx) / f, yd = (v - cy) / f, r2 = xd * xd + yd * yd;
+      gdouble k = 1.0 + k1 * r2 + k2 * r2 * r2, x = xd * k, y = yd * k;
+
+      zscale[v * GST_TOF_WIDTH + u] = (gfloat) (1.0 / sqrt (1.0 + x * x + y * y));
+    }
+  }
+  GST_INFO_OBJECT (self, "lens %s: f %.3f, cx %.2f, cy %.2f, k1 %+.5f, k2 %+.5f; corner z/r %.5f", path, f, cx,
+      cy, k1, k2, zscale[0]);
+  return TRUE;
+}
+
+/* the lens of lens= (errors if unusable), else the [lens] group of the calibration file cal_path (if any);
+ * depth-type=z without a lens fails */
+static gboolean
+load_lens (GstTofDepth * self, const gchar * cal_path)
+{
+  GstTofDepthType type;
+  gchar *path;
+  gboolean explicit, have = FALSE;
+
+  GST_OBJECT_LOCK (self);
+  path = g_strdup (self->lens);
+  type = self->depth_type;
+  GST_OBJECT_UNLOCK (self);
+  explicit = path && *path;
+  if (!explicit) {
+    g_free (path);
+    path = cal_path && *cal_path ? g_strdup (cal_path) : NULL;
+  }
+  g_clear_pointer (&self->zscale, g_free);
+  if (path) {
+    GKeyFile *kf = g_key_file_new ();
+    GError *err = NULL;
+
+    if (!g_key_file_load_from_file (kf, path, G_KEY_FILE_NONE, &err)) {
+      if (explicit || type == GST_TOF_DEPTH_Z) {
+        GST_ELEMENT_ERROR (self, RESOURCE, OPEN_READ, ("Cannot read lens %s.", path), ("%s", err->message));
+        g_error_free (err);
+        g_key_file_free (kf);
+        g_free (path);
+        return FALSE;
+      }
+      g_clear_error (&err);
+    } else if (g_key_file_has_group (kf, "lens")) {
+      self->zscale = g_new (gfloat, N_PIX);
+      have = lens_parse (self, kf, path, self->zscale);
+      if (!have) {
+        g_clear_pointer (&self->zscale, g_free);
+        if (explicit || type == GST_TOF_DEPTH_Z) {
+          GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("Invalid lens model in %s.", path),
+              ("[lens] needs f > 0, cx, cy, k1 (k2 optional); width/height, if given, %ux%u.", GST_TOF_WIDTH,
+                  GST_TOF_HEIGHT));
+          g_key_file_free (kf);
+          g_free (path);
+          return FALSE;
+        }
+        GST_WARNING_OBJECT (self, "ignoring the invalid [lens] group of %s (depth-type=radial)", path);
+      }
+    } else if (explicit) {
+      GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("%s has no [lens] group.", path), (NULL));
+      g_key_file_free (kf);
+      g_free (path);
+      return FALSE;
+    }
+    g_key_file_free (kf);
+  }
+  if (!have && type == GST_TOF_DEPTH_Z) {
+    GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("depth-type=z needs a lens model."),
+        ("Set lens= to a key file with a [lens] group (f, cx, cy, k1, optional k2; tools/tof-lens.py writes one), "
+            "or add that group to the calibration file."));
+    g_free (path);
+    return FALSE;
+  }
+  GST_OBJECT_LOCK (self);
+  g_free (self->lens_used);
+  self->lens_used = have ? path : NULL;
+  GST_OBJECT_UNLOCK (self);
+  if (!have)
+    g_free (path);
+  return TRUE;
+}
+
+static gboolean
+load_models (GstTofDepth * self)
+{
+  gchar *cal;
+  gboolean ok;
+
+  if (!load_calibration (self))
+    return FALSE;
+  GST_OBJECT_LOCK (self);
+  cal = g_strdup (self->calibration_used);
+  GST_OBJECT_UNLOCK (self);
+  ok = load_lens (self, cal);
+  g_free (cal);
+  if (!ok)
+    self->models_loaded = FALSE;
   return ok;
 }
 
@@ -999,6 +1144,7 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   gboolean active[N_OUT];
   guint mode, flying = 0;
   gfloat flying_thr;
+  gboolean to_z;
   guint64 t0 = g_get_monotonic_time ();
 
   if (!self->models_loaded && !load_models (self)) {
@@ -1020,12 +1166,17 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   for (guint k = 0; k < N_OUT; k++)
     active[k] = self->outs[k].pad && gst_pad_is_linked (self->outs[k].pad);
   flying_thr = (gfloat) self->flying_pixel_threshold;
+  to_z = self->depth_type == GST_TOF_DEPTH_Z && self->zscale;
   GST_OBJECT_UNLOCK (self);
 
   compute (self, map.data, active[OUT_DEPTH] || active[OUT_CONFIDENCE]);
   gst_buffer_unmap (inbuf, &map);
   if (flying_thr > 0.0f && (active[OUT_DEPTH] || active[OUT_CONFIDENCE]))
     flying = remove_flying_pixels (self, flying_thr);
+  /* the flying-pixel test judged the measured (radial) distance; 0 = invalid stays 0 */
+  if (to_z && active[OUT_DEPTH])
+    for (guint p = 0; p < N_PIX; p++)
+      self->dist[p] *= self->zscale[p];
 
   for (guint k = 0; k < N_OUT; k++) {
     GstFlowReturn r;
@@ -1318,6 +1469,13 @@ gst_tof_depth_set_property (GObject * object, guint prop_id, const GValue * valu
       self->flying_pixel_threshold = g_value_get_double (value);
       break;
     case PROP_DEPTH_TYPE:
+      self->depth_type = g_value_get_enum (value);
+      self->models_loaded = FALSE;
+      break;
+    case PROP_LENS:
+      g_free (self->lens);
+      self->lens = g_value_dup_string (value);
+      self->models_loaded = FALSE;
       break;
     case PROP_PROCESSING_LATENCY:
       self->processing_latency = g_value_get_int64 (value);
@@ -1367,7 +1525,10 @@ gst_tof_depth_get_property (GObject * object, guint prop_id, GValue * value,
       g_value_set_double (value, self->flying_pixel_threshold);
       break;
     case PROP_DEPTH_TYPE:
-      g_value_set_enum (value, GST_TOF_DEPTH_RADIAL);
+      g_value_set_enum (value, self->depth_type);
+      break;
+    case PROP_LENS:
+      g_value_set_string (value, self->lens);
       break;
     case PROP_PROCESSING_LATENCY:
       g_value_set_int64 (value, self->processing_latency);
@@ -1376,6 +1537,8 @@ gst_tof_depth_get_property (GObject * object, guint prop_id, GValue * value,
       g_value_take_boxed (value, gst_structure_new ("stats",
               "groups", G_TYPE_UINT64, self->n_groups,
               "calibration", G_TYPE_STRING, self->calibration_used,
+              "depth-type", G_TYPE_STRING, self->depth_type == GST_TOF_DEPTH_Z ? "z" : "radial",
+              "lens", G_TYPE_STRING, self->lens_used ? self->lens_used : "",
               "flying-pixels", G_TYPE_UINT64, self->n_flying,
               "mean-process-us", G_TYPE_DOUBLE,
               self->n_groups ? self->proc_ns / 1000.0 / self->n_groups : 0.0, NULL));
@@ -1394,6 +1557,9 @@ gst_tof_depth_finalize (GObject * object)
 
   g_free (self->calibration);
   g_free (self->calibration_used);
+  g_free (self->lens);
+  g_free (self->lens_used);
+  g_free (self->zscale);
   g_free (self->dist);
   g_free (self->amp);
   g_free (self->sum_i);
@@ -1456,15 +1622,22 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
           "with a jump above this (m) on each side (mixed foreground/background); 0 = off", 0.0, 1.0,
           DEFAULT_FLYING_PIXEL_THRESHOLD, rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_DEPTH_TYPE,
-      g_param_spec_enum ("depth-type", "Depth type", "Distance definition of the depth output",
+      g_param_spec_enum ("depth-type", "Depth type", "Distance definition of the depth output: radial "
+          "(along each pixel's ray, as calibrated) or z (along the optical axis, needs a lens model)",
           gst_tof_depth_type_get_type (), GST_TOF_DEPTH_RADIAL, rw | GST_PARAM_MUTABLE_READY));
+  g_object_class_install_property (gobject_class, PROP_LENS,
+      g_param_spec_string ("lens", "Lens model",
+          "Key file with a [lens] group (f, cx, cy, k1, optional k2: pinhole + inverse radial distortion, "
+          "tools/tof-lens.py); unset = the calibration file's [lens] group, if it has one. Needed by depth-type=z",
+          NULL, rw | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_PROCESSING_LATENCY,
       g_param_spec_int64 ("processing-latency", "Processing latency",
           "Time (ns) from a group's arrival to its outputs, added to the latency query; -1 = automatic "
           "(4 ms + 2.5 ms per linked output)", -1, GST_SECOND, DEFAULT_PROCESSING_LATENCY,
           rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_STATS,
-      g_param_spec_boxed ("stats", "Statistics", "groups, calibration (file in use, \"\" = none), flying-pixels (removed in all), mean-process-us",
+      g_param_spec_boxed ("stats", "Statistics", "groups, calibration (file in use, \"\" = none), depth-type, lens (file in use, \"\" = none), "
+          "flying-pixels (removed in all), mean-process-us",
           GST_TYPE_STRUCTURE, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_add_static_pad_template (element_class, &sink_template);
@@ -1499,6 +1672,7 @@ gst_tof_depth_init (GstTofDepth * self)
   self->confidence_scale = DEFAULT_CONFIDENCE_SCALE;
   self->temporal_average = DEFAULT_TEMPORAL_AVERAGE;
   self->flying_pixel_threshold = DEFAULT_FLYING_PIXEL_THRESHOLD;
+  self->depth_type = GST_TOF_DEPTH_RADIAL;
   self->processing_latency = DEFAULT_PROCESSING_LATENCY;
   self->fps_n = 30;
   self->fps_d = 1;

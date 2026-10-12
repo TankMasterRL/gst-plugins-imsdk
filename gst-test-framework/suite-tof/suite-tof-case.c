@@ -12,6 +12,9 @@
  *                 makes READY -> PAUSED fail; the stats name the file in use (arducam-tof-ventuno DEC-0026)
  *   flying-pixels a synthetic step 0.8 m | mixed column | 1.4 m: flying-pixel-threshold=0.05 clears exactly the
  *                 mixed column, threshold 0 changes nothing (arducam-tof-ventuno RUN-0080)
+ *   depth-z       depth-type=z with a test lens on a constant-distance group: every pixel = r / |(x, y, 1)| of the
+ *                 lens within 1 mm; radial unchanged with a lens set; the calibration's [lens] group is used when
+ *                 lens is unset; z without a lens, or with an unusable one, fails to start (arducam-tof-ventuno RUN-0085)
  * The live cases need the Arducam ToF on CAMERA0 with the ToF boot entry and drivers loaded.
  */
 
@@ -459,6 +462,157 @@ GST_START_TEST (test_tof_flying_pixels)
 }
 GST_END_TEST;
 
+/* GRAY16_LE depth (mm) of one uncalibrated near-mode group whose pixels all read d metres (phi_ref 0, R 2 m) */
+static guint16 *
+depth_of_constant (const gchar * props, gdouble d)
+{
+  gchar *launch = g_strdup_printf ("qtitofdepth calibration=\"\" %s", props);
+  GstHarness *h = gst_harness_new_parse (launch);
+  GstBuffer *in = gst_buffer_new_allocate (NULL, TOF_SIZE, NULL), *out;
+  GstMapInfo map;
+  gint16 *f;
+  guint16 *depth = g_new (guint16, TOF_PIX);
+  const gdouble phi = -2.0 * G_PI * d / 2.0;
+  const gint16 c = (gint16) lround (200.0 * cos (phi)), s = (gint16) lround (200.0 * sin (phi));
+
+  gst_buffer_map (in, &map, GST_MAP_WRITE);
+  memset (map.data, 0, TOF_HDR);
+  GST_WRITE_UINT32_LE (map.data, TOF_MAGIC);
+  GST_WRITE_UINT16_LE (map.data + 4, TOF_HDR);
+  map.data[40] = map.data[41] = 1;
+  f = (gint16 *) (map.data + TOF_HDR);
+  for (guint p = 0; p < TOF_PIX; p++) {
+    f[p] = GINT16_TO_LE (c);
+    f[TOF_PIX + p] = GINT16_TO_LE (s);
+    f[2 * TOF_PIX + p] = GINT16_TO_LE ((gint16) - c);
+    f[3 * TOF_PIX + p] = GINT16_TO_LE ((gint16) - s);
+  }
+  gst_buffer_unmap (in, &map);
+  gst_harness_set_src_caps_str (h, TOF_DCS_CAPS);
+  gst_harness_set_sink_caps_str (h,
+      "video/x-raw, format=(string)GRAY16_LE, width=(int)240, height=(int)180, framerate=(fraction)30/1");
+  fail_unless_equals_int (gst_harness_push (h, in), GST_FLOW_OK);
+  out = gst_harness_pull (h);
+  fail_unless (out != NULL);
+  gst_buffer_map (out, &map, GST_MAP_READ);
+  fail_unless (map.size >= TOF_PIX * 2);
+  for (guint p = 0; p < TOF_PIX; p++)
+    depth[p] = GST_READ_UINT16_LE (map.data + 2 * p);
+  gst_buffer_unmap (out, &map);
+  gst_buffer_unref (out);
+  gst_harness_teardown (h);
+  g_free (launch);
+  return depth;
+}
+
+/* z / r of pixel (u, v): 1 / |(x, y, 1)|, x = xd (1 + k1 rd^2 + k2 rd^4), xd = (u - cx) / f (tools/tof-lens.py) */
+static gdouble
+lens_zscale (guint u, guint v, gdouble f, gdouble cx, gdouble cy, gdouble k1, gdouble k2)
+{
+  gdouble xd = (u - cx) / f, yd = (v - cy) / f, r2 = xd * xd + yd * yd, k = 1.0 + k1 * r2 + k2 * r2 * r2;
+
+  return 1.0 / sqrt (1.0 + xd * k * xd * k + yd * k * yd * k);
+}
+
+static gchar *
+write_tmp (const gchar * contents)
+{
+  gchar *path = NULL;
+  gint fd = g_file_open_tmp ("tof-lens-XXXXXX.conf", &path, NULL);
+
+  fail_unless (fd >= 0);
+  fail_unless (g_file_set_contents (path, contents, -1, NULL));
+  close (fd);
+  return path;
+}
+
+/* READY -> PAUSED of a qtitofdepth with these properties: success or failure */
+static GstStateChangeReturn
+start_depth (const gchar * calibration, const gchar * lens, gint depth_type, gchar ** lens_used)
+{
+  GstElement *e = gst_element_factory_make ("qtitofdepth", NULL);
+  GstStateChangeReturn r;
+
+  g_object_set (e, "calibration", calibration, "depth-type", depth_type, NULL);
+  if (lens)
+    g_object_set (e, "lens", lens, NULL);
+  r = gst_element_set_state (e, GST_STATE_PAUSED);
+  if (r == GST_STATE_CHANGE_SUCCESS && lens_used) {
+    GstStructure *stats;
+
+    g_object_get (e, "stats", &stats, NULL);
+    *lens_used = g_strdup (gst_structure_get_string (stats, "lens"));
+    fail_unless_equals_string (gst_structure_get_string (stats, "depth-type"), depth_type ? "z" : "radial");
+    gst_structure_free (stats);
+  }
+  gst_element_set_state (e, GST_STATE_NULL);
+  gst_object_unref (e);
+  return r;
+}
+
+GST_START_TEST (test_tof_depth_z)
+{
+  const gdouble d = 1.2, f = 200.0, cx = 119.5, cy = 89.5, k1 = 0.1;
+  gchar *lens = write_tmp ("[lens]\nf=200\ncx=119.5\ncy=89.5\nk1=0.1\nk2=0\nwidth=240\nheight=180\n");
+  gchar *bad_f = write_tmp ("[lens]\nf=0\ncx=119.5\ncy=89.5\nk1=0\n");
+  gchar *no_group = write_tmp ("[calibration]\nformat=2\n");
+  gchar *cal = write_tmp ("[calibration]\nformat=2\n[far]\nR=4.0\nphi_ref=0\nc0=0\n[near]\nR=2.0\nphi_ref=0\n"
+      "c0=0\n[lens]\nf=200\ncx=119.5\ncy=89.5\nk1=0.1\n");
+  gchar *props, *used = NULL;
+  guint16 *radial = depth_of_constant ("", d), *radial_lens, *z;
+  gint worst = 0;
+  guint worst_px = 0;
+
+  props = g_strdup_printf ("lens=%s", lens);
+  radial_lens = depth_of_constant (props, d);
+  g_free (props);
+  props = g_strdup_printf ("depth-type=z lens=%s", lens);
+  z = depth_of_constant (props, d);
+  g_free (props);
+  for (guint p = 0; p < TOF_PIX; p++) {
+    /* radial mm (rounded) times z/r vs z from the unrounded distance: within 1 mm */
+    gint e = z[p] - (gint) lround (radial[p] * lens_zscale (p % TOF_W, p / TOF_W, f, cx, cy, k1, 0.0));
+
+    fail_unless (ABS (radial[p] - 1200) <= 1, "radial %u at pixel %u", radial[p], p);
+    fail_unless (radial_lens[p] == radial[p], "radial changed by a lens at pixel %u", p);
+    if (ABS (e) > ABS (worst)) {
+      worst = e;
+      worst_px = p;
+    }
+  }
+  fail_unless (ABS (worst) <= 1, "z: max error %d mm at pixel %u", worst, worst_px);
+  /* the centre keeps r, the corner (0, 0) is ~0.785 r with this lens */
+  fail_unless (ABS (z[90 * TOF_W + 120] - 1200) <= 1, "centre z %u", z[90 * TOF_W + 120]);
+  fail_unless (z[0] > 930 && z[0] < 955, "corner z %u", z[0]);
+
+  /* lens unset: the calibration's [lens] group */
+  fail_unless_equals_int (start_depth (cal, NULL, 1, &used), GST_STATE_CHANGE_SUCCESS);
+  fail_unless_equals_string (used, cal);
+  g_free (used);
+  /* radial without any lens: fine, stats lens "" */
+  fail_unless_equals_int (start_depth ("", NULL, 0, &used), GST_STATE_CHANGE_SUCCESS);
+  fail_unless_equals_string (used, "");
+  g_free (used);
+  /* z without a lens, or with an unusable one, does not start; an explicit unusable lens fails also for radial */
+  fail_unless_equals_int (start_depth ("", NULL, 1, NULL), GST_STATE_CHANGE_FAILURE);
+  fail_unless_equals_int (start_depth ("", bad_f, 1, NULL), GST_STATE_CHANGE_FAILURE);
+  fail_unless_equals_int (start_depth ("", no_group, 1, NULL), GST_STATE_CHANGE_FAILURE);
+  fail_unless_equals_int (start_depth ("", "/nonexistent/tof-lens.conf", 0, NULL), GST_STATE_CHANGE_FAILURE);
+
+  g_free (radial);
+  g_free (radial_lens);
+  g_free (z);
+  g_unlink (lens);
+  g_unlink (bad_f);
+  g_unlink (no_group);
+  g_unlink (cal);
+  g_free (lens);
+  g_free (bad_f);
+  g_free (no_group);
+  g_free (cal);
+}
+GST_END_TEST;
+
 static Suite *
 tof_suite (GList ** tcnames, gint iteration, gint duration)
 {
@@ -493,6 +647,12 @@ tof_suite (GList ** tcnames, gint iteration, gint duration)
   *tcnames = g_list_append (*tcnames, (gpointer) tcname);
   suite_add_tcase (s, tc);
   tcase_add_loop_test (tc, test_tof_flying_pixels, start, end);
+
+  tcname = "depth-z";
+  tc = tcase_create (tcname);
+  *tcnames = g_list_append (*tcnames, (gpointer) tcname);
+  suite_add_tcase (s, tc);
+  tcase_add_loop_test (tc, test_tof_depth_z, start, end);
 
   tcname = "stream";
   tc = tcase_create (tcname);
