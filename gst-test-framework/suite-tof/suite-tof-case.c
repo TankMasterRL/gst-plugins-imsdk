@@ -738,6 +738,93 @@ GST_START_TEST (test_tof_pointcloud)
 }
 GST_END_TEST;
 
+/* Near-mode group whose pixels all read 0.5 m (phi_ref 0, R 2 m): columns < 80 amplitude 200, 80..159 amplitude 10,
+ * >= 160 amplitude 5. Returns the GRAY16_LE depth (mm), the stats' wrap-flagged count and the push result. */
+static guint16 *
+depth_of_bands (const gchar * calibration, gdouble rho, guint64 * wrapped, GstFlowReturn * flow)
+{
+  gchar *launch = g_strdup_printf ("qtitofdepth calibration=\"%s\" wrap-reflectivity=%g", calibration, rho);
+  GstHarness *h = gst_harness_new_parse (launch);
+  GstElement *el = gst_harness_find_element (h, "qtitofdepth");
+  GstBuffer *in = gst_buffer_new_allocate (NULL, TOF_SIZE, NULL), *out;
+  GstStructure *stats;
+  GstMapInfo map;
+  gint16 *f;
+  guint16 *depth = g_new0 (guint16, TOF_PIX);
+
+  gst_buffer_map (in, &map, GST_MAP_WRITE);
+  memset (map.data, 0, TOF_HDR);
+  GST_WRITE_UINT32_LE (map.data, TOF_MAGIC);
+  GST_WRITE_UINT16_LE (map.data + 4, TOF_HDR);
+  map.data[40] = map.data[41] = 1;
+  f = (gint16 *) (map.data + TOF_HDR);
+  for (guint p = 0; p < TOF_PIX; p++) {
+    guint x = p % TOF_W;
+    gint16 a = x < 80 ? 200 : x < 160 ? 10 : 5;
+
+    /* phi = -2 pi 0.5 / 2 = -pi / 2: F0 = F2 = 0, F1 = -a, F3 = a, so I = 0, Q = -2a and the amplitude is a */
+    f[TOF_PIX + p] = GINT16_TO_LE (-a);
+    f[3 * TOF_PIX + p] = GINT16_TO_LE (a);
+  }
+  gst_buffer_unmap (in, &map);
+  gst_harness_set_src_caps_str (h, TOF_DCS_CAPS);
+  gst_harness_set_sink_caps_str (h,
+      "video/x-raw, format=(string)GRAY16_LE, width=(int)240, height=(int)180, framerate=(fraction)30/1");
+  *flow = gst_harness_push (h, in);
+  if (*flow == GST_FLOW_OK) {
+    out = gst_harness_pull (h);
+    fail_unless (out != NULL);
+    gst_buffer_map (out, &map, GST_MAP_READ);
+    fail_unless (map.size >= TOF_PIX * 2);
+    for (guint p = 0; p < TOF_PIX; p++)
+      depth[p] = GST_READ_UINT16_LE (map.data + 2 * p);
+    gst_buffer_unmap (out, &map);
+    gst_buffer_unref (out);
+  }
+  g_object_get (el, "stats", &stats, NULL);
+  fail_unless (gst_structure_get_uint64 (stats, "wrap-flagged", wrapped));
+  gst_structure_free (stats);
+  gst_object_unref (el);
+  gst_harness_teardown (h);
+  g_free (launch);
+  return depth;
+}
+
+GST_START_TEST (test_tof_wrap)
+{
+  /* bound at r = 0.5 m, R = 2 m, rho 2: 2 * 20 / 2.5^2 + 3 * 0.5 = 7.9 counts -> amplitude 5 may be wrapped, 10 not */
+  gchar *cal = write_tmp ("[calibration]\nformat=2\n"
+      "[far]\nR=4.0\nphi_ref=0\nc0=0\nwrap_k=20\nwrap_sigma=0.5\n"
+      "[near]\nR=2.0\nphi_ref=0\nc0=0\nwrap_k=20\nwrap_sigma=0.5\n");
+  guint64 n_off = 1, n_on = 0, n_err = 0;
+  GstFlowReturn flow;
+  guint16 *off = depth_of_bands (cal, 0.0, &n_off, &flow), *on, *err;
+
+  fail_unless_equals_int (flow, GST_FLOW_OK);
+  fail_unless_equals_uint64 (n_off, 0);
+  for (guint p = 0; p < TOF_PIX; p++)
+    fail_unless (ABS (off[p] - 500) <= 1, "pixel %u: %u mm without the test", p, off[p]);
+  on = depth_of_bands (cal, 2.0, &n_on, &flow);
+  fail_unless_equals_int (flow, GST_FLOW_OK);
+  for (guint p = 0; p < TOF_PIX; p++) {
+    if (p % TOF_W >= 160)
+      fail_unless (on[p] == 0, "weak pixel %u kept (%u)", p, on[p]);
+    else
+      fail_unless (on[p] == off[p], "pixel %u changed %u -> %u", p, off[p], on[p]);
+  }
+  fail_unless_equals_uint64 (n_on, 80 * TOF_H);
+  /* enabled without the calibration's wrap reference: an error, no output */
+  err = depth_of_bands ("", 2.0, &n_err, &flow);
+  fail_unless_equals_int (flow, GST_FLOW_ERROR);
+  fail_unless_equals_uint64 (n_err, 0);
+  g_free (off);
+  g_free (on);
+  g_free (err);
+  g_unlink (cal);
+  g_free (cal);
+}
+GST_END_TEST;
+
 static Suite *
 tof_suite (GList ** tcnames, gint iteration, gint duration)
 {
@@ -784,6 +871,12 @@ tof_suite (GList ** tcnames, gint iteration, gint duration)
   *tcnames = g_list_append (*tcnames, (gpointer) tcname);
   suite_add_tcase (s, tc);
   tcase_add_loop_test (tc, test_tof_pointcloud, start, end);
+
+  tcname = "wrap";
+  tc = tcase_create (tcname);
+  *tcnames = g_list_append (*tcnames, (gpointer) tcname);
+  suite_add_tcase (s, tc);
+  tcase_add_loop_test (tc, test_tof_wrap, start, end);
 
   tcname = "stream";
   tc = tcase_create (tcname);

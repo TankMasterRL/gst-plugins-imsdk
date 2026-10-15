@@ -17,12 +17,18 @@
  * tools/tof-lens.py) in the lens= file or the calibration file; a per-pixel table built at load time, applied
  * after the flying-pixel pass.
  *
+ * wrap-reflectivity (arducam-tof-ventuno RUN-0090/RUN-0091): one modulation frequency per mode, so a surface beyond R
+ * reads r = d - R. A target one range further gives at most rho K / (r + R)^2 (K = wrap_k of the calibration's mode
+ * group, the reference target's amplitude x m^2); a valid pixel whose amplitude is not above that bound plus
+ * 3 wrap_sigma / sqrt (groups averaged) could be wrapped and becomes invalid, before the flying-pixel pass.
+ *
  * Pads: "src" (always) depth, GRAY16_LE millimetres or a colour-mapped view; "amplitude" and
  * "confidence" (request); "pointcloud" (request, RUN-0086): the QIM SDK tensor format
  * (neural-network/tensors, FLOAT32, 1 x 180 x 240 x 3 + GstMLTensorMeta), per pixel X, Y, Z in metres
  * (x right, y down, z forward) from the lens model, NaN = invalid. Outputs not linked are not computed. Invalid pixels (amplitude below
- * min-amplitude, or a DCS sample at the 11-bit rails) are 0. Output buffers come from the downstream
- * image pool or from a QIM image pool with the QTI DMA-buf allocator (videotransform.c pattern).
+ * min-amplitude, or a DCS sample at the 11-bit rails; optionally possible range wraps and flying pixels) are 0.
+ * Output buffers come from the downstream image pool or from a QIM image pool with the QTI DMA-buf allocator
+ * (videotransform.c pattern).
  */
 
 #ifdef HAVE_CONFIG_H
@@ -63,6 +69,8 @@ GST_DEBUG_CATEGORY_STATIC (gst_tof_depth_debug);
 #define DEFAULT_CONFIDENCE_SCALE 64.0
 #define DEFAULT_TEMPORAL_AVERAGE 1
 #define DEFAULT_FLYING_PIXEL_THRESHOLD 0.0
+#define DEFAULT_WRAP_REFLECTIVITY 0.0
+#define WRAP_NOISE_Z             3.0     /* noise allowance in sigma (RUN-0090) */
 #define DEFAULT_PROCESSING_LATENCY -1
 /* automatic processing latency: live p99 after the source push, NEON build, unpinned (arducam-tof-ventuno
  * RUN-0064): ~6 ms with one output, ~9.3 ms for the third of three (max 11.2) */
@@ -112,6 +120,7 @@ enum
   PROP_CONFIDENCE_SCALE,
   PROP_TEMPORAL_AVERAGE,
   PROP_FLYING_PIXEL_THRESHOLD,
+  PROP_WRAP_REFLECTIVITY,
   PROP_DEPTH_TYPE,
   PROP_LENS,
   PROP_PROCESSING_LATENCY,
@@ -125,6 +134,7 @@ typedef struct
   gdouble c0, c1;
   gdouble a[MAX_HARMONICS], b[MAX_HARMONICS];   /* terms of 4 (h + 1) theta */
   gfloat lut[LUT_SIZE + 1];                     /* unwrapped distance (m) over u */
+  gdouble wrap_k, wrap_sigma;                   /* wrap reference: amplitude x m^2, noise (counts); 0 = none */
   gboolean calibrated;
 } TofModel;
 
@@ -157,6 +167,7 @@ struct _GstTofDepth
   gdouble confidence_scale;
   guint temporal_average;
   gdouble flying_pixel_threshold;  /* m, 0 = off */
+  gdouble wrap_reflectivity;    /* relative to the calibration's wrap_k, 0 = off */
   GstTofDepthType depth_type;
   gchar *lens;                  /* key file with [lens], NULL = the calibration's [lens] group if any */
   gchar *lens_used;             /* file in use, NULL = no lens (stats) */
@@ -178,11 +189,13 @@ struct _GstTofDepth
   gboolean dist_is_z;           /* dist of the current group already scaled to z */
   guint hist_count, hist_pos, hist_n;
   gint hist_mode;
+  guint avg_count;              /* groups averaged into the current one */
 
   /* stats (object lock) */
   guint64 n_groups;
   guint64 proc_ns;
   guint64 n_flying;
+  guint64 n_wrap;
 };
 
 #define gst_tof_depth_parent_class parent_class
@@ -298,6 +311,10 @@ model_load (GstTofDepth * self, GKeyFile * kf, const gchar * group, TofModel * m
     if (g_key_file_has_key (kf, group, key, NULL))
       m->b[h] = g_key_file_get_double (kf, group, key, NULL);
   }
+  if (g_key_file_has_key (kf, group, "wrap_k", NULL))
+    m->wrap_k = g_key_file_get_double (kf, group, "wrap_k", NULL);
+  if (g_key_file_has_key (kf, group, "wrap_sigma", NULL))
+    m->wrap_sigma = g_key_file_get_double (kf, group, "wrap_sigma", NULL);
   if (g_key_file_has_key (kf, group, "oI", NULL) || g_key_file_has_key (kf, group, "oQ", NULL))
     GST_WARNING_OBJECT (self, "calibration [%s]: I/Q offset terms are not supported, ignored", group);
   if (m->r <= 0.0) {
@@ -661,6 +678,7 @@ compute (GstTofDepth * self, const guint8 * data, gboolean want_depth)
       self->hist_count++;
     self->hist_pos = (self->hist_pos + 1) % navg;
   }
+  self->avg_count = navg > 1 ? self->hist_count : 1;
 
 #ifdef TOF_HAVE_NEON
   if (use_simd) {
@@ -702,6 +720,47 @@ compute (GstTofDepth * self, const guint8 * data, gboolean want_depth)
       self->dist[p] = 1.0f;     /* valid marker only */
     }
   }
+}
+
+/* Range wrap: a valid pixel whose amplitude a target rho times as bright as the wrap reference could give from one
+ * range further (r + R) - within the noise allowance - becomes invalid. Radial distance, before the flying pixels.
+ * A <= rho K / (r + R)^2 + noise is tested as (A - noise) (r + R)^2 <= rho K (no division); the NEON path does the
+ * same float operations in the same order, 4 pixels per step (bit-identical; the scalar loop is latency-bound on the
+ * in-order A55, RUN-0091). */
+static guint
+remove_wrapped (GstTofDepth * self, const TofModel * m, gfloat rho)
+{
+  const gfloat k = rho * (gfloat) m->wrap_k, r = (gfloat) m->r;
+  const gfloat noise = (gfloat) (WRAP_NOISE_Z * m->wrap_sigma / sqrt ((gdouble) self->avg_count));
+  gfloat *dist = self->dist;
+  const gfloat *amp = self->amp;
+  guint n = 0;
+
+#ifdef TOF_HAVE_NEON
+  if (use_simd) {
+    const float32x4_t vk = vdupq_n_f32 (k), vr = vdupq_n_f32 (r), vn = vdupq_n_f32 (noise);
+    const float32x4_t zero = vdupq_n_f32 (0.0f);
+    uint32x4_t cnt = vdupq_n_u32 (0);
+
+    for (guint p = 0; p < N_PIX; p += 4) {
+      float32x4_t d = vld1q_f32 (dist + p), s = vaddq_f32 (d, vr);
+      uint32x4_t w = vandq_u32 (vcgtq_f32 (d, zero),
+          vcleq_f32 (vmulq_f32 (vsubq_f32 (vld1q_f32 (amp + p), vn), vmulq_f32 (s, s)), vk));
+
+      vst1q_f32 (dist + p, vbslq_f32 (w, zero, d));
+      cnt = vsubq_u32 (cnt, w);         /* a set lane is all ones = -1 */
+    }
+    return vaddvq_u32 (cnt);
+  }
+#endif
+  for (guint p = 0; p < N_PIX; p++) {
+    gfloat d = dist[p], s = d + r;
+    guint w = (d > 0.0f) & ((amp[p] - noise) * (s * s) <= k);
+
+    dist[p] = w ? 0.0f : d;
+    n += w;
+  }
+  return n;
 }
 
 /* Flying pixels: on a depth edge a pixel sees foreground and background, and its mixed phasor gives a depth in
@@ -1226,8 +1285,8 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   GstFlowReturn ret = GST_FLOW_OK;
   GstMapInfo map;
   gboolean active[N_OUT];
-  guint mode, flying = 0;
-  gfloat flying_thr;
+  guint mode, flying = 0, wrapped = 0;
+  gfloat flying_thr, wrap_rho;
   gboolean to_z;
   guint64 t0 = g_get_monotonic_time ();
 
@@ -1250,6 +1309,7 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   for (guint k = 0; k < N_OUT; k++)
     active[k] = self->outs[k].pad && gst_pad_is_linked (self->outs[k].pad);
   flying_thr = (gfloat) self->flying_pixel_threshold;
+  wrap_rho = (gfloat) self->wrap_reflectivity;
   to_z = self->depth_type == GST_TOF_DEPTH_Z && self->zscale;
   GST_OBJECT_UNLOCK (self);
 
@@ -1260,8 +1320,18 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
     gst_buffer_unref (inbuf);
     return GST_FLOW_ERROR;
   }
+  if (wrap_rho > 0.0f && (self->models[mode].wrap_k <= 0.0 || self->models[mode].wrap_sigma <= 0.0)) {
+    gst_buffer_unmap (inbuf, &map);
+    GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("wrap-reflectivity needs the calibration's wrap reference."),
+        ("Add wrap_k and wrap_sigma to its [%s] group (tools/tof-wrap.py conf).",
+            mode == GST_TOF_RANGE_NEAR ? "near" : "far"));
+    gst_buffer_unref (inbuf);
+    return GST_FLOW_ERROR;
+  }
   compute (self, map.data, active[OUT_DEPTH] || active[OUT_CONFIDENCE] || active[OUT_POINTCLOUD]);
   gst_buffer_unmap (inbuf, &map);
+  if (wrap_rho > 0.0f && (active[OUT_DEPTH] || active[OUT_CONFIDENCE] || active[OUT_POINTCLOUD]))
+    wrapped = remove_wrapped (self, &self->models[mode], wrap_rho);
   if (flying_thr > 0.0f && (active[OUT_DEPTH] || active[OUT_CONFIDENCE] || active[OUT_POINTCLOUD]))
     flying = remove_flying_pixels (self, flying_thr);
   /* the flying-pixel test judged the measured (radial) distance; 0 = invalid stays 0 */
@@ -1286,6 +1356,7 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   GST_OBJECT_LOCK (self);
   self->n_groups++;
   self->n_flying += flying;
+  self->n_wrap += wrapped;
   self->proc_ns += (g_get_monotonic_time () - t0) * 1000;
   GST_OBJECT_UNLOCK (self);
   gst_buffer_unref (inbuf);
@@ -1566,6 +1637,9 @@ gst_tof_depth_set_property (GObject * object, guint prop_id, const GValue * valu
     case PROP_FLYING_PIXEL_THRESHOLD:
       self->flying_pixel_threshold = g_value_get_double (value);
       break;
+    case PROP_WRAP_REFLECTIVITY:
+      self->wrap_reflectivity = g_value_get_double (value);
+      break;
     case PROP_DEPTH_TYPE:
       self->depth_type = g_value_get_enum (value);
       self->models_loaded = FALSE;
@@ -1622,6 +1696,9 @@ gst_tof_depth_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_FLYING_PIXEL_THRESHOLD:
       g_value_set_double (value, self->flying_pixel_threshold);
       break;
+    case PROP_WRAP_REFLECTIVITY:
+      g_value_set_double (value, self->wrap_reflectivity);
+      break;
     case PROP_DEPTH_TYPE:
       g_value_set_enum (value, self->depth_type);
       break;
@@ -1638,6 +1715,7 @@ gst_tof_depth_get_property (GObject * object, guint prop_id, GValue * value,
               "depth-type", G_TYPE_STRING, self->depth_type == GST_TOF_DEPTH_Z ? "z" : "radial",
               "lens", G_TYPE_STRING, self->lens_used ? self->lens_used : "",
               "flying-pixels", G_TYPE_UINT64, self->n_flying,
+              "wrap-flagged", G_TYPE_UINT64, self->n_wrap,
               "mean-process-us", G_TYPE_DOUBLE,
               self->n_groups ? self->proc_ns / 1000.0 / self->n_groups : 0.0, NULL));
       break;
@@ -1721,6 +1799,12 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
           "Invalidate edge pixels whose depth lies between both neighbours along a row, column or diagonal "
           "with a jump above this (m) on each side (mixed foreground/background); 0 = off", 0.0, 1.0,
           DEFAULT_FLYING_PIXEL_THRESHOLD, rw | GST_PARAM_MUTABLE_PLAYING));
+  g_object_class_install_property (gobject_class, PROP_WRAP_REFLECTIVITY,
+      g_param_spec_double ("wrap-reflectivity", "Wrap reflectivity",
+          "Invalidate pixels that may lie one range further (beyond 2 m near / 4 m far): those whose amplitude "
+          "a target this bright, relative to the calibration's wrap reference (wrap_k, wrap_sigma of each mode), "
+          "could give from there; 2 = the measured setting (RUN-0090), 0 = off", 0.0, 100.0,
+          DEFAULT_WRAP_REFLECTIVITY, rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_DEPTH_TYPE,
       g_param_spec_enum ("depth-type", "Depth type", "Distance definition of the depth output: radial "
           "(along each pixel's ray, as calibrated) or z (along the optical axis, needs a lens model)",
@@ -1737,7 +1821,7 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
           rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_STATS,
       g_param_spec_boxed ("stats", "Statistics", "groups, calibration (file in use, \"\" = none), depth-type, lens (file in use, \"\" = none), "
-          "flying-pixels (removed in all), mean-process-us",
+          "flying-pixels (removed in all), wrap-flagged (removed in all), mean-process-us",
           GST_TYPE_STRUCTURE, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_add_static_pad_template (element_class, &sink_template);
@@ -1791,6 +1875,7 @@ gst_tof_depth_init (GstTofDepth * self)
   self->confidence_scale = DEFAULT_CONFIDENCE_SCALE;
   self->temporal_average = DEFAULT_TEMPORAL_AVERAGE;
   self->flying_pixel_threshold = DEFAULT_FLYING_PIXEL_THRESHOLD;
+  self->wrap_reflectivity = DEFAULT_WRAP_REFLECTIVITY;
   self->depth_type = GST_TOF_DEPTH_RADIAL;
   self->processing_latency = DEFAULT_PROCESSING_LATENCY;
   self->fps_n = 30;
