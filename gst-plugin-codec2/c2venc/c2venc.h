@@ -82,14 +82,19 @@ struct _GstC2VEncoder {
   GstStructure         *roi_quant_values;
   GArray               *roi_quant_boxes;
 
+  GstC2QuantMbmapInfo  mb_map_info;
+
   GstC2EntropyMode     entropy_mode;
   GstC2LoopFilterMode  loop_filter_mode;
   guint32              num_ltr_frames;
   gint32               priority;
   GstC2TemporalLayer   temp_layer;
   gint32               vbv_delay;
+  gint32               bitrate_boost_margin;
   GstC2HdrMode         hdr_mode;
   gint32               chroma_qp_offset;
+  GstC2EncodingMode    encoding_mode;
+  GstC2Cac             cac;
 };
 
 struct _GstC2VEncoderClass {

@@ -44,6 +44,9 @@ struct _GstMLQnn {
 
   GstMLQnnEngine    *engine;
 
+  /// The type of hardware being utilized.
+  gchar             hw_util[10];
+
   /// Properties.
   gchar             *model;
   gchar             *backend;

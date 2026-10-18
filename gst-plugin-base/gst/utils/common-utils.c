@@ -354,7 +354,34 @@ gst_buffer_copy_protection_meta (GstBuffer * destination, GstBuffer * source)
   }
 }
 
-#if GLIB_MAJOR_VERSION < 2 || (GLIB_MAJOR_VERSION == 2 && GLIB_MINOR_VERSION < 62)
+#if !GLIB_CHECK_VERSION(2, 76, 0)
+GArray *
+g_array_new_take (gpointer data, gsize len, gboolean clear, gsize size)
+{
+  GArray *newarray = g_array_sized_new (clear, clear, size, len);
+
+  g_array_append_vals (newarray, data, len);
+  g_free (data);
+
+  return newarray;
+}
+#endif // GLIB_CHECK_VERSION(2, 76, 0)
+
+#if !GLIB_CHECK_VERSION(2, 64, 0)
+gpointer
+g_array_steal (GArray * array, gsize * size)
+{
+  gpointer data = (gpointer) array->data;
+
+  if (size != NULL)
+    *size = array->len;
+
+  g_array_free (array, FALSE);
+  return data;
+}
+#endif // GLIB_CHECK_VERSION(2, 64, 0)
+
+#if !GLIB_CHECK_VERSION(2, 62, 0)
 GArray *
 g_array_copy (GArray * array)
 {
@@ -369,7 +396,7 @@ g_array_copy (GArray * array)
 
   return newarray;
 }
-#endif // GLIB_MAJOR_VERSION < 2 || (GLIB_MAJOR_VERSION == 2 && GLIB_MINOR_VERSION < 62)
+#endif // GLIB_CHECK_VERSION(2, 62, 0)
 
 GParamSpec *
 g_param_spec_copy (GParamSpec * param, const gchar * prefix)

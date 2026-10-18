@@ -12,7 +12,7 @@
 #include <vector>
 
 #ifdef ENABLE_WIDEVINE
-#include <ce_cdm/cdm.h>
+#include <cdm.h>
 #endif
 #include <media/drm/DrmAPI.h>
 
@@ -62,6 +62,11 @@ class PlayreadyContext : public DrmContext {
 };
 
 #ifdef ENABLE_WIDEVINE
+// To be obtained and specified post Widevine license agreement.
+// These can be overridden at runtime via --cdm-prov and --cdm-lic options.
+#define CDM_PROV_URL           ""
+#define CDM_LIC_URL            ""
+
 class WidevineContext : public DrmContext, public widevine::Cdm::IEventListener {
   private:
     class WVStorageImpl : public widevine::Cdm::IStorage {
@@ -135,29 +140,42 @@ class WidevineContext : public DrmContext, public widevine::Cdm::IEventListener 
         void cancel(IClient* client) override {}
     };
 
+    class WVLoggerImpl : public widevine::Cdm::ILogger {
+      public:
+        void log(const std::string& message) override {}
+    };
+
     gint InitSession() override;
     gint CreateLicenseRequest() override;
     gint FetchLicense() override;
     gint ProvideKeyResponse() override;
 
-    widevine::Cdm* GetCdmInstance() { return cdm_; }
+    void* GetCdmInstance() override { return cdm_; }
     std::string FetchProvisioningResponse(std::string request);
 
     widevine::Cdm                  *cdm_;
     std::promise<std::string>      on_message_;
+    std::string                    prov_url_;
+    std::string                    lic_url_;
 
   public:
-    WidevineContext(gchar * header) : DrmContext (header), cdm_ (nullptr) {
+    WidevineContext(gchar * header, const gchar * prov_url,
+        const gchar * lic_url) :
+        DrmContext (header), cdm_ (nullptr),
+        prov_url_ ((prov_url && *prov_url) ? prov_url : CDM_PROV_URL),
+        lic_url_ ((lic_url && *lic_url) ? lic_url : CDM_LIC_URL) {
       storage_impl = new WVStorageImpl();
       clock_impl = new WVClockImpl();
       timer_impl = new WVTimerImpl();
+      logger_impl = new WVLoggerImpl();
     }
     ~WidevineContext();
 
     // widevine::Cdm::IEventListener
     void onMessage(const std::string& session_id,
                     widevine::Cdm::MessageType message_type,
-                    const std::string& message) override {
+                    const std::string& message,
+                    const std::string& server_url) override {
       if (session_id == session_id_ && message_type == widevine::Cdm::kLicenseRequest)
         on_message_.set_value (message);
       else
@@ -165,10 +183,13 @@ class WidevineContext : public DrmContext, public widevine::Cdm::IEventListener 
     }
     void onKeyStatusesChange (const std::string& session_id,
         bool has_new_usable_key) override {}
+    void onExpirationChange(const std::string& session_id,
+        int64_t new_expiration) override {}
     void onRemoveComplete(const std::string& session_id) override {}
 
     WVStorageImpl *storage_impl;
     WVClockImpl   *clock_impl;
     WVTimerImpl   *timer_impl;
+    WVLoggerImpl  *logger_impl;
 };
 #endif

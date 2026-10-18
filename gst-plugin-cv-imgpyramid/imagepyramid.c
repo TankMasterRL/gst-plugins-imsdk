@@ -83,9 +83,6 @@ struct _GstCvRequest
   GstBufferList *outbuffers;
   // Number of output frames.
   guint         n_outputs;
-
-  // Time it took for this request to be processed.
-  GstClockTime  time;
 };
 
 GST_DEFINE_MINI_OBJECT_TYPE (GstCvRequest, gst_cv_request);
@@ -124,7 +121,6 @@ gst_cv_request_new ()
   request->inframe = NULL;
   request->outbuffers = NULL;
   request->n_outputs = 0;
-  request->time = GST_CLOCK_TIME_NONE;
 
   return request;
 }
@@ -243,6 +239,7 @@ gst_cv_imgpyramid_worker_task (gpointer userdata)
 
   if (gst_data_queue_peek (sinkpad->requests, &item)) {
     GstCvRequest *request = GST_CV_REQUEST (item->object);
+    GstClockTime time = gst_util_get_timestamp ();
 
     success = gst_imgpyramid_engine_execute (imgpyramid->engine,
         request->inframe, request->outbuffers);
@@ -255,6 +252,12 @@ gst_cv_imgpyramid_worker_task (gpointer userdata)
 
       return;
     }
+
+    time = GST_CLOCK_DIFF (time, gst_util_get_timestamp ());
+
+    GST_LOG_OBJECT (imgpyramid, "Performance time %" G_GINT64_FORMAT ".%03"
+        G_GINT64_FORMAT " ms, HW utilization: %s", GST_TIME_AS_MSECONDS (time),
+        (GST_TIME_AS_USECONDS (time) % 1000), HW_UTILIZATION);
 
     g_hash_table_foreach (imgpyramid->srcpads,
         (GHFunc) gst_cv_imgpyramid_push_output_buffer, request);
@@ -337,12 +340,10 @@ gst_cv_imgpyramid_sinkpad_chain (GstPad * pad, GstObject * parent,
 
   // Convenient structure containing all the necessary data.
   request = gst_cv_request_new ();
+
   request->inframe = g_new0 (GstVideoFrame, 1);
   request->outbuffers = gst_buffer_list_new ();
   request->n_outputs = imgpyramid->n_levels;
-
-  // Get start time for performance measurements.
-  request->time = gst_util_get_timestamp ();
 
   success = gst_video_frame_map (request->inframe,
       GST_CV_IMGPYRAMID_SINKPAD (pad)->info, inbuffer,

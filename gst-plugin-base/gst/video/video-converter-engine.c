@@ -18,20 +18,9 @@
 #include "ocv-video-converter.h"
 #endif // HAVE_OPENCV_H
 
-#include <gst/utils/common-utils.h>
-
 
 #define GST_CAT_DEFAULT gst_video_converter_engine_debug
 GST_DEBUG_CATEGORY (gst_video_converter_engine_debug);
-
-#define INT8_CONVERSION_OFFSET   (G_MAXUINT8 / 2 + 1)
-#define INT16_CONVERSION_OFFSET  (G_MAXUINT16 / 2 + 1)
-#define UINT16_CONVERSION_SCALE  (G_MAXUINT16 / G_MAXUINT8)
-#define INT32_CONVERSION_OFFSET  (G_MAXUINT32 / 2 + 1)
-#define UINT32_CONVERSION_SCALE  (G_MAXUINT32 / G_MAXUINT8)
-#define INT64_CONVERSION_OFFSET  (G_MAXUINT64 / 2 + 1)
-#define UINT64_CONVERSION_SCALE  (G_MAXUINT64 / G_MAXUINT8)
-#define FLOAT_CONVERSION_SCALE   (1.0 / G_MAXUINT8)
 
 /**
  * GstVideoConvNewFunction:
@@ -83,7 +72,7 @@ typedef gboolean (*GstVideoConvWaitFenceFunction) (gpointer converter,
 typedef void (*GstVideoConvFlushFunction) (gpointer converter);
 
 /**
- * GstVideoConvEngine:
+ * GstVideoConverterEngine:
  * @parent: Parent instance.
  * @converter: Pointer underlying converter backend.
  * @new: Pointer to the new function of the underlying converter.
@@ -94,7 +83,7 @@ typedef void (*GstVideoConvFlushFunction) (gpointer converter);
  *
  * Base class for video converter engine.
  */
-struct _GstVideoConvEngine {
+struct _GstVideoConverterEngine {
   GObject                       parent;
 
   gpointer                      converter;
@@ -107,17 +96,17 @@ struct _GstVideoConvEngine {
   GstVideoConvFlushFunction     flush;
 };
 
-G_DEFINE_TYPE (GstVideoConvEngine, gst_video_converter_engine, G_TYPE_OBJECT)
+G_DEFINE_TYPE (GstVideoConverterEngine, gst_video_converter_engine, G_TYPE_OBJECT)
 
 static void
-gst_video_converter_engine_class_init (GstVideoConvEngineClass * klass)
+gst_video_converter_engine_class_init (GstVideoConverterEngineClass * klass)
 {
   GST_DEBUG_CATEGORY_INIT (gst_video_converter_engine_debug,
       "video-converter-engine", 0, "QTI Video Converter Engine");
 }
 
 static void
-gst_video_converter_engine_init (GstVideoConvEngine * engine)
+gst_video_converter_engine_init (GstVideoConverterEngine * engine)
 {
   engine->converter = NULL;
 
@@ -129,99 +118,24 @@ gst_video_converter_engine_init (GstVideoConvEngine * engine)
   engine->flush = NULL;
 }
 
-static inline gboolean
-gst_data_normalization (gpointer data, guint idx, gdouble value,
-    gdouble mean, gdouble sigma, guint64 datatype) {
-
-  switch (datatype) {
-    case GST_VCE_DATA_TYPE_U8:
-    {
-      GST_UINT8_PTR_CAST (data)[idx] = (guint8) ((value - mean) * sigma);
-      break;
-    }
-    case GST_VCE_DATA_TYPE_I8:
-    {
-      gint8 newvalue = value - INT8_CONVERSION_OFFSET;
-      GST_INT8_PTR_CAST (data)[idx] = (gint8) ((newvalue - mean) * sigma);
-      break;
-    }
-    case GST_VCE_DATA_TYPE_U16:
-    {
-      guint16 newvalue = value * UINT16_CONVERSION_SCALE;
-      GST_UINT16_PTR_CAST (data)[idx] = (guint16) ((newvalue - mean) * sigma);
-      break;
-    }
-    case GST_VCE_DATA_TYPE_I16:
-    {
-      gint16 newvalue = value * UINT16_CONVERSION_SCALE - INT16_CONVERSION_OFFSET;
-      GST_INT16_PTR_CAST (data)[idx] = (gint16) ((newvalue - mean) * sigma);
-      break;
-    }
-    case GST_VCE_DATA_TYPE_U32:
-    {
-      guint32 newvalue = value * UINT32_CONVERSION_SCALE;
-      GST_UINT32_PTR_CAST (data)[idx] = (guint32) ((newvalue - mean) * sigma);
-      break;
-    }
-    case GST_VCE_DATA_TYPE_I32:
-    {
-      gint32 newvalue = value * UINT32_CONVERSION_SCALE - INT32_CONVERSION_OFFSET;
-      GST_INT32_PTR_CAST (data)[idx] = (gint32) ((newvalue - mean) * sigma);
-      break;
-    }
-    case GST_VCE_DATA_TYPE_U64:
-    {
-      guint64 newvalue = ((guint64) value) * UINT64_CONVERSION_SCALE;
-      GST_UINT64_PTR_CAST (data)[idx] = (guint64) ((newvalue - mean) * sigma);
-      break;
-    }
-    case GST_VCE_DATA_TYPE_I64:
-    {
-      gint64 newvalue = ((gint64) value) * UINT64_CONVERSION_SCALE -
-          INT64_CONVERSION_OFFSET;
-      GST_INT64_PTR_CAST (data)[idx] = (gint64) ((newvalue - mean) * sigma);
-      break;
-    }
-#if defined(__ARM_FP16_FORMAT_IEEE)
-    case GST_VCE_DATA_TYPE_F16:
-    {
-      __fp16 newvalue = value * FLOAT_CONVERSION_SCALE;
-      GST_FLOAT16_PTR_CAST (data)[idx] = (__fp16) ((newvalue - mean) * sigma);
-      break;
-    }
-#endif //__ARM_FP16_FORMAT_IEEE
-    case GST_VCE_DATA_TYPE_F32:
-    {
-      gfloat newvalue = value * FLOAT_CONVERSION_SCALE;
-      GST_FLOAT_PTR_CAST (data)[idx] = (gfloat) ((newvalue - mean) * sigma);
-      break;
-    }
-    default:
-      GST_ERROR ("Unsupported type: 0x%016" G_GINT64_MODIFIER "X", datatype);
-      return FALSE;
-  }
-
-  return TRUE;
-}
-
 GType
 gst_video_converter_backend_get_type (void)
 {
   static GType gtype = 0;
 
   static const GEnumValue variants[] = {
-    { GST_VCE_BACKEND_NONE, "No backend used", "none" },
+    { GST_VIDEO_CONVERTER_BACKEND_NONE, "No backend used", "none" },
 #ifdef HAVE_ADRENO_C2D2_H
-    { GST_VCE_BACKEND_C2D, "Use C2D based video converter", "c2d" },
+    { GST_VIDEO_CONVERTER_BACKEND_C2D, "Use C2D based video converter", "c2d" },
 #endif // HAVE_ADRENO_C2D2_H
 #ifdef HAVE_GLES2_H
-    { GST_VCE_BACKEND_GLES, "Use OpenGLES based video converter", "gles" },
+    { GST_VIDEO_CONVERTER_BACKEND_GLES, "Use OpenGLES based video converter", "gles" },
 #endif // HAVE_GLES2_H
 #ifdef HAVE_FASTCV_H
-    { GST_VCE_BACKEND_FCV, "Use FastCV based video converter", "fcv" },
+    { GST_VIDEO_CONVERTER_BACKEND_FCV, "Use FastCV based video converter", "fcv" },
 #endif // HAVE_FASTCV_H
 #ifdef HAVE_OPENCV_H
-    { GST_VCE_BACKEND_OCV, "Use OpenCV based video converter", "ocv" },
+    { GST_VIDEO_CONVERTER_BACKEND_OCV, "Use OpenCV based video converter", "ocv" },
 #endif // HAVE_OPENCV_H
     { 0, NULL, NULL },
   };
@@ -232,120 +146,38 @@ gst_video_converter_backend_get_type (void)
   return gtype;
 }
 
-gboolean
-gst_video_quadrilateral_is_rectangle (const GstVideoQuadrilateral * quadrilateral)
-{
-  return (quadrilateral->a.x == quadrilateral->b.x) &&
-      (quadrilateral->c.x == quadrilateral->d.x) &&
-      (quadrilateral->a.y == quadrilateral->c.y) &&
-      (quadrilateral->b.y == quadrilateral->d.y);
-}
-
-void
-gst_video_quadrilateral_from_rectangle (GstVideoQuadrilateral * quadrilateral,
-    const GstVideoRectangle * rectangle)
-{
-  quadrilateral->a.x = rectangle->x;
-  quadrilateral->a.y = rectangle->y;
-  quadrilateral->b.x = rectangle->x;
-  quadrilateral->b.y = rectangle->y + rectangle->h;
-  quadrilateral->c.x = rectangle->x + rectangle->w;
-  quadrilateral->c.y = rectangle->y;
-  quadrilateral->d.x = rectangle->x + rectangle->w;
-  quadrilateral->d.y = rectangle->y + rectangle->h;
-}
-
-void
-gst_video_quadrilateral_to_rectangle (
-    const GstVideoQuadrilateral * quadrilateral, GstVideoRectangle * rectangle)
-{
-  rectangle->x = quadrilateral->a.x;
-  rectangle->y = quadrilateral->a.y;
-  rectangle->w = quadrilateral->d.x - quadrilateral->a.x;
-  rectangle->h = quadrilateral->d.y - quadrilateral->a.y;
-}
-
-gboolean
-gst_video_frame_normalize_ip (GstVideoFrame * vframe, guint64 datatype,
-    gdouble offsets[GST_VCE_MAX_CHANNELS], gdouble scales[GST_VCE_MAX_CHANNELS])
-{
-  guint8 *indata = NULL;
-  gpointer outdata = NULL;
-  gint row = 0, column = 0, width = 0, height = 0, idx = 0, bpp = 0;
-  gboolean success = TRUE, normalize = FALSE;
-
-  // Raise the normalization flag if output is not UINT8.
-  normalize = (datatype != GST_VCE_DATA_TYPE_U8);
-
-  // The flag will be raised also if there are custom nomalization params.
-  for (idx = 0; idx < GST_VCE_MAX_CHANNELS; idx++)
-    normalize |= (offsets[idx] != 0) || (scales[idx] != 1);
-
-  if (!normalize)
-    return TRUE;
-
-  GST_TRACE ("Normalization for %" GST_PTR_FORMAT, vframe->buffer);
-
-  // Retrive the video frame Bytes Per Pixel for later calculations.
-  bpp = GST_VIDEO_FORMAT_INFO_BITS (vframe->info.finfo) *
-      GST_VIDEO_FORMAT_INFO_N_COMPONENTS (vframe->info.finfo);
-  bpp /= 8;
-
-  indata = GST_VIDEO_FRAME_PLANE_DATA (vframe, 0);
-  outdata = GST_VIDEO_FRAME_PLANE_DATA (vframe, 0);
-
-  width = GST_VIDEO_FRAME_WIDTH (vframe);
-  height = GST_VIDEO_FRAME_HEIGHT (vframe);
-
-  // Normalize in reverse as front bytes are occupied.
-  for (row = (height - 1); row >= 0; row--) {
-    for (column = ((width * bpp) - 1); (column >= 0) && success; column--) {
-      idx = (row * width * bpp) + column;
-
-      // Convert value to actual type and apply normalization.
-      success = gst_data_normalization (outdata, idx, indata[idx],
-          offsets[idx % bpp], scales[idx % bpp], datatype);
-    }
-  }
-
-  if (!success)
-    GST_ERROR ("Normalization failed for %" GST_PTR_FORMAT, vframe->buffer);
-
-  return success;
-}
-
-GstVideoConvBackend
+GstVideoConverterBackend
 gst_video_converter_default_backend (void)
 {
-  GstVideoConvBackend backend = GST_VCE_BACKEND_FCV;
+  GstVideoConverterBackend backend = GST_VIDEO_CONVERTER_BACKEND_FCV;
 
 #if defined(HAVE_GLES2_H)
-  backend = GST_VCE_BACKEND_GLES;
+  backend = GST_VIDEO_CONVERTER_BACKEND_GLES;
 #elif defined(HAVE_ADRENO_C2D2_H)
-  backend = GST_VCE_BACKEND_C2D;
+  backend = GST_VIDEO_CONVERTER_BACKEND_C2D;
 #elif defined(HAVE_OPENCV_H)
-  backend = GST_VCE_BACKEND_OCV;
+  backend = GST_VIDEO_CONVERTER_BACKEND_OCV;
 #endif // !HAVE_IOT_CORE_IB2C_H && !HAVE_ADRENO_C2D2_H && ! HAVE_OPENCV_H
 
   return backend;
 }
 
-GstVideoConvEngine *
-gst_video_converter_engine_new (GstVideoConvBackend backend,
+GstVideoConverterEngine *
+gst_video_converter_engine_new (GstVideoConverterBackend backend,
                                 GstStructure * settings)
 {
-  GstVideoConvEngine *engine = NULL;
+  GstVideoConverterEngine *engine = NULL;
 
   engine = g_object_new (GST_TYPE_VIDEO_CONVERTER_ENGINE, NULL);
   g_return_val_if_fail (engine != NULL, FALSE);
 
   switch (backend) {
-    case GST_VCE_BACKEND_NONE:
+    case GST_VIDEO_CONVERTER_BACKEND_NONE:
       // No engine required
       g_object_unref (engine);
       return NULL;
 #ifdef HAVE_ADRENO_C2D2_H
-    case GST_VCE_BACKEND_C2D:
+    case GST_VIDEO_CONVERTER_BACKEND_C2D:
       engine->new = (GstVideoConvNewFunction) gst_c2d_video_converter_new;
       engine->free = (GstVideoConvFreeFunction) gst_c2d_video_converter_free;
       engine->compose =
@@ -356,7 +188,7 @@ gst_video_converter_engine_new (GstVideoConvBackend backend,
       break;
 #endif // HAVE_ADRENO_C2D2_H
 #ifdef HAVE_GLES2_H
-    case GST_VCE_BACKEND_GLES:
+    case GST_VIDEO_CONVERTER_BACKEND_GLES:
       engine->new = (GstVideoConvNewFunction) gst_gles_video_converter_new;
       engine->free = (GstVideoConvFreeFunction) gst_gles_video_converter_free;
       engine->compose =
@@ -367,7 +199,7 @@ gst_video_converter_engine_new (GstVideoConvBackend backend,
       break;
 #endif // HAVE_GLES2_H
 #ifdef HAVE_FASTCV_H
-    case GST_VCE_BACKEND_FCV:
+    case GST_VIDEO_CONVERTER_BACKEND_FCV:
       engine->new = (GstVideoConvNewFunction) gst_fcv_video_converter_new;
       engine->free = (GstVideoConvFreeFunction) gst_fcv_video_converter_free;
       engine->compose =
@@ -378,7 +210,7 @@ gst_video_converter_engine_new (GstVideoConvBackend backend,
       break;
 #endif // HAVE_FASTCV_H
 #ifdef HAVE_OPENCV_H
-    case GST_VCE_BACKEND_OCV:
+    case GST_VIDEO_CONVERTER_BACKEND_OCV:
       engine->new = (GstVideoConvNewFunction) gst_ocv_video_converter_new;
       engine->free = (GstVideoConvFreeFunction) gst_ocv_video_converter_free;
       engine->compose =
@@ -406,7 +238,7 @@ cleanup:
 }
 
 void
-gst_video_converter_engine_free (GstVideoConvEngine * engine)
+gst_video_converter_engine_free (GstVideoConverterEngine * engine)
 {
   if (engine == NULL)
     return;
@@ -416,7 +248,7 @@ gst_video_converter_engine_free (GstVideoConvEngine * engine)
 }
 
 gboolean
-gst_video_converter_engine_compose (GstVideoConvEngine * engine,
+gst_video_converter_engine_compose (GstVideoConverterEngine * engine,
     GstVideoComposition * compositions, guint n_compositions, gpointer * fence)
 {
   g_return_val_if_fail (engine != NULL, FALSE);
@@ -426,7 +258,7 @@ gst_video_converter_engine_compose (GstVideoConvEngine * engine,
 }
 
 gboolean
-gst_video_converter_engine_wait_fence  (GstVideoConvEngine * engine,
+gst_video_converter_engine_wait_fence  (GstVideoConverterEngine * engine,
     gpointer fence)
 {
   g_return_val_if_fail (engine != NULL, FALSE);
@@ -438,7 +270,7 @@ gst_video_converter_engine_wait_fence  (GstVideoConvEngine * engine,
 }
 
 void
-gst_video_converter_engine_flush (GstVideoConvEngine * engine)
+gst_video_converter_engine_flush (GstVideoConverterEngine * engine)
 {
   g_return_if_fail (engine != NULL);
 

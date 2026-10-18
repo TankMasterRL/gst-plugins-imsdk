@@ -26,7 +26,6 @@
 #include <glib-unix.h>
 #include <gst/gst.h>
 #include <unordered_map>
-#include <gst_sample_apps_utils.h>
 #include <qmmf-sdk/qmmf_camera_metadata.h>
 
 namespace camera = qmmf;
@@ -67,6 +66,11 @@ static gboolean eos_on_shutdown = TRUE;
 static gboolean display = FALSE;
 static gint stream_width = DEFAULT_OUTPUT_WIDTH;
 static gint stream_height = DEFAULT_OUTPUT_HEIGHT;
+
+// Recieves a list of pointers to variable containing pointer to gst element
+// and unrefs the gst element if needed
+void
+cleanup_gst (void * first_elem, ...);
 
 /**
  * Create and initialize application context:
@@ -176,6 +180,24 @@ handle_interrupt_signal (gpointer userdata)
   }
 
   return TRUE;
+}
+
+/* Receives a list of pointers to variable containing pointer to gst element
+ *  and unrefs the gst element if needed
+ */
+void
+cleanup_gst (void *first_elem, ...)
+{
+  va_list args;
+  void **p_gst_obj = (void **) first_elem;
+
+  va_start (args, first_elem);
+  while (p_gst_obj) {
+    if (*p_gst_obj)
+      gst_object_unref (*p_gst_obj);
+    p_gst_obj = va_arg (args, void **);
+  }
+  va_end (args);
 }
 
 static gboolean

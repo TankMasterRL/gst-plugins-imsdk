@@ -22,7 +22,7 @@ custom_lib_create_handle (VideoTemplateCb * callback, void *priv_data)
   gst_video_info_init (&custom_lib->outinfo_);
 
   // for reference functionality
-  custom_lib->backend = GST_VCE_BACKEND_GLES;
+  custom_lib->backend = GST_VIDEO_CONVERTER_BACKEND_GLES;
   custom_lib->converter = NULL;
 
   return custom_lib;
@@ -150,41 +150,39 @@ CustomCmdStatus
 custom_lib_process_buffer (CustomLib * custom_lib,
     GstBuffer * inbuffer, GstBuffer * outbuffer)
 {
+  GstVideoBlit *vblit = NULL;
+  GstVideoComposition composition = GST_VIDEO_COMPOSITION_INIT;
+  GstClockTime time = GST_CLOCK_TIME_NONE;
   gboolean success = FALSE;
 
   if (NULL == custom_lib) {
-    GST_ERROR ("NULL lib");
+    GST_ERROR ("No library has been provided!");
     return CUSTOM_STATUS_FAIL;
   }
 
-  {
-    GstVideoBlit blit = GST_VCE_BLIT_INIT;
-    GstVideoComposition composition = GST_VCE_COMPOSITION_INIT;
-    GstClockTime time = GST_CLOCK_TIME_NONE;
+  time = gst_util_get_timestamp ();
 
-    time = gst_util_get_timestamp ();
+  composition.blits = gst_video_blits_new_sized (1);
+  vblit = gst_video_blits_entry (composition.blits, 0);
 
-    blit.buffer = inbuffer;
-    blit.mask |= GST_VCE_MASK_FLIP_VERTICAL;
+  vblit->buffer = inbuffer;
+  vblit->mask |= GST_VIDEO_CONVERTER_MASK_FLIP_VERTICAL;
 
-    composition.blits = &blit;
-    composition.n_blits = 1;
+  composition.buffer = outbuffer;
+  composition.datatype = GST_VIDEO_DATA_TYPE_U8;
 
-    composition.buffer = outbuffer;
-    composition.datatype = 0;
+  composition.bgcolor = 0;
+  composition.bgfill = FALSE;
 
-    composition.bgcolor = 0;
-    composition.bgfill = FALSE;
+  success = gst_video_converter_engine_compose (custom_lib->converter,
+      &composition, 1, NULL);
+  gst_video_blits_unref (composition.blits);
 
-    success = gst_video_converter_engine_compose (custom_lib->converter,
-        &composition, 1, NULL);
+  time = GST_CLOCK_DIFF (time, gst_util_get_timestamp ());
 
-    time = GST_CLOCK_DIFF (time, gst_util_get_timestamp ());
-
-    GST_LOG ("Conversion took %" G_GINT64_FORMAT ".%03"
-        G_GINT64_FORMAT " ms", GST_TIME_AS_MSECONDS (time),
-        (GST_TIME_AS_USECONDS (time) % 1000));
-  }
+  GST_LOG ("Conversion took %" G_GINT64_FORMAT ".%03"
+      G_GINT64_FORMAT " ms", GST_TIME_AS_MSECONDS (time),
+      (GST_TIME_AS_USECONDS (time) % 1000));
 
   (*custom_lib->cb_.unlock_buf_for_writing) (outbuffer);
 

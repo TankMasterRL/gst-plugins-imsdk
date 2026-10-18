@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -56,7 +57,7 @@ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
         ", layout = (string) interleaved, channels = (int) 1")
     );
 
-#define GST_ML_TFLITE_TENSOR_TYPES "{ INT8, UINT8, INT32, FLOAT16, FLOAT32 }"
+#define GST_ML_TFLITE_TENSOR_TYPES "{ FLOAT32 }"
 
 #define GST_SRC_PAD_CAPS                        \
     "neural-network/tensors, "                    \
@@ -113,13 +114,55 @@ gst_ml_audio_conversion_feature_get_type (void)
   return gtype;
 }
 
+// Read an integer field from the "params" structure, falling back to the
+// provided default value when the field is missing.
+static gint
+gst_ml_audio_converter_get_param_int (GstMLAudioConverter * mlconverter,
+    const gchar * field, gint default_value)
+{
+  gint result = default_value;
+
+  if (mlconverter->params != NULL &&
+      gst_structure_has_field (mlconverter->params, field))
+    gst_structure_get_int (mlconverter->params, field, &result);
+
+  return result;
+}
+
+// Append a tensor dimension list to the "dimensions" GST_TYPE_ARRAY.
+// The variadic arguments are the individual dimension sizes (gint), the
+// list MUST be terminated with a negative value.
+static void
+gst_ml_audio_converter_append_tensor (GValue * dimensions, gint first, ...)
+{
+  GValue entry = G_VALUE_INIT, dimension = G_VALUE_INIT;
+  va_list args;
+  gint dim = first;
+
+  g_value_init (&entry, GST_TYPE_ARRAY);
+  g_value_init (&dimension, G_TYPE_INT);
+
+  va_start (args, first);
+  while (dim >= 0) {
+    g_value_set_int (&dimension, dim);
+    gst_value_array_append_value (&entry, &dimension);
+    dim = va_arg (args, gint);
+  }
+  va_end (args);
+
+  g_value_unset (&dimension);
+
+  gst_value_array_append_value (dimensions, &entry);
+  g_value_unset (&entry);
+}
+
 static GstCaps *
 gst_ml_audio_converter_translate_audio_caps (GstMLAudioConverter * mlconverter,
   GstCaps * caps)
 {
   GstCaps *result = NULL;
   GstStructure *structure = NULL;
-  GValue dimensions = G_VALUE_INIT, entry = G_VALUE_INIT, dimension = G_VALUE_INIT;
+  GValue dimensions = G_VALUE_INIT;
   const GValue *value;
 
   if (gst_caps_is_empty (caps) || gst_caps_is_any (caps))
@@ -132,16 +175,41 @@ gst_ml_audio_converter_translate_audio_caps (GstMLAudioConverter * mlconverter,
   structure = gst_caps_get_structure (caps, 0);
 
   g_value_init (&dimensions, GST_TYPE_ARRAY);
-  g_value_init (&entry, GST_TYPE_ARRAY);
-  g_value_init (&dimension, G_TYPE_INT);
 
-  g_value_set_int (&dimension, mlconverter->sample_rate);
+  // The output tensor shape depends on the configured feature. For features
+  // that produce a time-frequency representation (e.g. LMFE) the shape is
+  // multi-dimensional and must be derived from the preprocessing parameters,
+  // otherwise downstream multi-dim tensor caps cannot be negotiated.
+  switch (mlconverter->feature) {
+    case GST_AUDIO_FEATURE_LMFE:
+    case GST_AUDIO_FEATURE_MFE:
+    {
+      gint n_hop, n_mels, n_windows;
+      gdouble chunklen = 0.0;
 
-  gst_value_array_append_value (&entry, &dimension);
-  g_value_unset (&dimension);
+      n_hop = gst_ml_audio_converter_get_param_int (mlconverter, "nhop", 160);
+      n_mels = gst_ml_audio_converter_get_param_int (mlconverter, "nmels", 64);
 
-  gst_value_array_append_value (&dimensions, &entry);
-  g_value_unset (&entry);
+      if (mlconverter->params != NULL &&
+          gst_structure_has_field (mlconverter->params, "chunklen"))
+        gst_structure_get_double (mlconverter->params, "chunklen", &chunklen);
+
+      // Number of frames (windows) produced by the STFT step.
+      n_windows = (n_hop > 0) ?
+          (gint) ((chunklen * mlconverter->sample_rate) / n_hop) : 0;
+
+      // Shape: [batch=1, channels=1, windows, mels].
+      gst_ml_audio_converter_append_tensor (&dimensions,
+          1, 1, n_windows, n_mels, -1);
+      break;
+    }
+    case GST_AUDIO_FEATURE_RAW:
+    default:
+      // Raw samples are emitted as a single dimensional tensor.
+      gst_ml_audio_converter_append_tensor (&dimensions,
+          mlconverter->sample_rate, -1);
+      break;
+  }
 
   gst_caps_set_value (result, "dimensions", &dimensions);
   g_value_unset (&dimensions);
@@ -341,6 +409,40 @@ gst_ml_audio_converter_transform_caps (GstBaseTransform * base,
   return result;
 }
 
+// othercaps may lack the peer's constraints when negotiation started
+// from already-fixed caps, so query the peer directly here
+static void
+gst_ml_audio_converter_fixate_field (GstBaseTransform * base,
+    GstCaps * othercaps, GstStructure * caps_struct,
+    GstStructure * mlcaps_struct, const gchar * field)
+{
+  const GValue *value = gst_structure_get_value (caps_struct, field);
+  GstCaps *peercaps;
+
+  if (value != NULL && gst_value_is_fixed (value))
+    return;
+
+  peercaps = gst_pad_peer_query_caps (
+      GST_BASE_TRANSFORM_SRC_PAD (base), othercaps);
+
+  if (peercaps != NULL) {
+    if (!gst_caps_is_empty (peercaps)) {
+      value = gst_structure_get_value (
+          gst_caps_get_structure (peercaps, 0), field);
+
+      if (value != NULL && gst_value_is_fixed (value)) {
+        gst_caps_set_value (othercaps, field, value);
+        gst_caps_unref (peercaps);
+        return;
+      }
+    }
+    gst_caps_unref (peercaps);
+  }
+
+  value = gst_structure_get_value (mlcaps_struct, field);
+  gst_caps_set_value (othercaps, field, value);
+}
+
 static GstCaps *
 gst_ml_audio_converter_fixate_caps (GstBaseTransform * base,
     GstPadDirection direction, GstCaps * caps, GstCaps * othercaps)
@@ -371,24 +473,18 @@ gst_ml_audio_converter_fixate_caps (GstBaseTransform * base,
           G_TYPE_INT, mlconverter->sample_rate, NULL);
 
   } else if (direction == GST_PAD_SINK) {
+    GstStructure *mlcaps_struct = NULL;
     mlcaps = gst_ml_audio_converter_translate_audio_caps (mlconverter, caps);
+    mlcaps_struct = gst_caps_get_structure (mlcaps, 0);
     caps_struct = gst_caps_get_structure (othercaps, 0);
 
     value = gst_structure_get_value (caps_struct, "dimensions");
 
-    if (NULL == value || !gst_value_is_fixed (value)) {
-      value = gst_structure_get_value (
-        gst_caps_get_structure (mlcaps, 0), "dimensions");
-      gst_caps_set_value (othercaps, "dimensions", value);
-    }
-
-    value = gst_structure_get_value (caps_struct, "type");
-
-    if (NULL == value || !gst_value_is_fixed (value)) {
-      value = gst_structure_get_value (
-          gst_caps_get_structure (mlcaps, 0), "type");
-      gst_caps_set_value (othercaps, "type", value);
-    }
+    // Preserve downstream fixed dimensions/type instead of overriding it.
+    gst_ml_audio_converter_fixate_field (base, othercaps, caps_struct,
+        mlcaps_struct, "dimensions");
+    gst_ml_audio_converter_fixate_field (base, othercaps, caps_struct,
+        mlcaps_struct, "type");
 
     gst_caps_unref (mlcaps);
   }
@@ -524,6 +620,8 @@ gst_ml_audio_converter_transform (GstBaseTransform * base,
       GST_BUFFER_FLAG_IS_SET (outbuffer, GST_BUFFER_FLAG_GAP))
     return GST_FLOW_OK;
 
+  time = gst_util_get_timestamp ();
+
   if (!gst_audio_buffer_map (&inframe, mlconverter->audio_info,
         inbuffer, GST_MAP_READ)) {
     GST_ERROR ("audio frame map failure");
@@ -552,11 +650,7 @@ gst_ml_audio_converter_transform (GstBaseTransform * base,
     goto unmap_audio;
   }
 
-  time = gst_util_get_timestamp ();
-
   success = gst_mlaconverter_engine_process (mlconverter->engine, &inframe, &outframe);
-
-  time = GST_CLOCK_DIFF (time, gst_util_get_timestamp ());
 
 #ifdef HAVE_LINUX_DMA_BUF_H
   if (gst_is_fd_memory (gst_buffer_peek_memory (outbuffer, 0))) {
@@ -579,16 +673,18 @@ gst_ml_audio_converter_transform (GstBaseTransform * base,
     goto unmap_ml;
   }
 
-  GST_LOG ("Execute took %" G_GINT64_FORMAT ".%03"
-      G_GINT64_FORMAT " ms", GST_TIME_AS_MSECONDS (time),
-      (GST_TIME_AS_USECONDS (time) % 1000));
-
   ret = GST_FLOW_OK;
 
 unmap_ml:
   gst_ml_frame_unmap (&outframe);
 unmap_audio:
   gst_audio_buffer_unmap (&inframe);
+
+  time = GST_CLOCK_DIFF (time, gst_util_get_timestamp ());
+
+  GST_LOG_OBJECT (mlconverter, "Performance time %" G_GINT64_FORMAT ".%03"
+      G_GINT64_FORMAT " ms, HW utilization: CPU", GST_TIME_AS_MSECONDS (time),
+      (GST_TIME_AS_USECONDS (time) % 1000));
 
   return ret;
 }

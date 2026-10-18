@@ -44,6 +44,7 @@
 #include <media/msm_media_info.h>
 
 
+GST_DEBUG_CATEGORY_EXTERN (gst_video_converter_engine_debug);
 #define GST_CAT_DEFAULT gst_video_converter_engine_debug
 
 #define CHECK_C2D_CAPABILITY(info, name) \
@@ -71,20 +72,20 @@ static gint refcount = 0;
 struct _GstC2dRequest
 {
   // The ID of the composition request.
-  guint         id;
+  guint            id;
 
   // Video frame which will be normalized.
-  GstVideoFrame *frame;
+  GstVideoFrame    *frame;
 
   // Mapped blit frames
-  GArray        *inframes;
+  GArray           *inframes;
 
   // Offset and scale factors for each component of the pixel.
-  gdouble       offsets[GST_VCE_MAX_CHANNELS];
-  gdouble       scales[GST_VCE_MAX_CHANNELS];
+  gdouble          offsets[GST_VIDEO_MAX_COMPONENTS];
+  gdouble          scales[GST_VIDEO_MAX_COMPONENTS];
 
-  // Configuration mask containing the type of the frame pixels.
-  guint64       flags;
+  // The data type of the frame pixels.
+  GstVideoDataType datatype;
 };
 
 struct _GstC2dVideoConverter
@@ -323,12 +324,14 @@ gst_c2d_blits_compatible (const GstVideoComposition * l_composition,
 {
   GstVideoBlit *l_blit = NULL, *r_blit = NULL;
   GstVideoRectangle l_rect = {0,}, r_rect = {0,};
-  guint idx = 0, l_fd = 0, r_fd = 0;
+  guint idx = 0, l_fd = 0, r_fd = 0, n_blits = 0;
+
+  n_blits = gst_video_blits_size (l_composition->blits);
 
   // TODO For now, support only same object ordering.
-  for (idx = 0; idx < l_composition->n_blits; idx++) {
-    l_blit = &(l_composition->blits[idx]);
-    r_blit = &(r_composition->blits[idx]);
+  for (idx = 0; idx < n_blits; idx++) {
+    l_blit = gst_video_blits_entry (l_composition->blits, idx);
+    r_blit = gst_video_blits_entry (r_composition->blits, idx);
 
     // Both entries need to have the same mask, rotate and global alpha.
     if ((l_blit->rotate != r_blit->rotate) ||
@@ -392,7 +395,7 @@ gst_c2d_optimize_composition (GstVideoBlit * blit,
   const GstVideoComposition *l_composition = NULL;
   gint l_score = -1, score = -1;
   gdouble l_ratio = 0.0, ratio = 0.0;
-  guint num = 0, l_resolution = 0, resolution = 0;
+  guint num = 0, l_resolution = 0, resolution = 0, l_size = 0, size = 0;
   gboolean optimized = FALSE;
 
   gst_util_fraction_to_double (GST_VIDEO_INFO_WIDTH (composition->info),
@@ -405,8 +408,11 @@ gst_c2d_optimize_composition (GstVideoBlit * blit,
   for (num = 0; num < index; num++) {
     l_composition = &(compositions[num]);
 
+    l_size = gst_video_blits_size (l_composition->blits);
+    size = gst_video_blits_size (composition->blits);
+
     // The number of blit entries must be the same.
-    if (l_composition->n_blits != composition->n_blits)
+    if (l_size != size)
       continue;
 
     // Background color settings have to match.
@@ -447,7 +453,6 @@ gst_c2d_optimize_composition (GstVideoBlit * blit,
     score = l_score;
 
     blit->buffer = l_composition->buffer;
-
     optimized = TRUE;
   }
 
@@ -777,7 +782,7 @@ static void
 gst_c2d_update_object (C2D_OBJECT * object, const guint surface_id,
     const GstVideoBlit * vblit, const GstVideoFrame * outframe)
 {
-  GstVideoConvRotate rotate = GST_VCE_ROTATE_0;
+  GstVideoRotate rotate = GST_VIDEO_ROTATE_0;
   gint x = 0, y = 0, width = 0, height = 0;
 
   object->surface_id = surface_id;
@@ -790,11 +795,11 @@ gst_c2d_update_object (C2D_OBJECT * object, const guint surface_id,
   if (object->global_alpha != G_MAXUINT8)
     object->config_mask |= C2D_GLOBAL_ALPHA_BIT;
 
-  if (vblit->mask & GST_VCE_MASK_ROTATION)
+  if (vblit->mask & GST_VIDEO_CONVERTER_MASK_ROTATION)
     rotate = vblit->rotate;
 
   // Setup the source rectangle.
-  if (vblit->mask & GST_VCE_MASK_SOURCE) {
+  if (vblit->mask & GST_VIDEO_CONVERTER_MASK_SOURCE) {
     x = vblit->source.a.x;
     y = vblit->source.a.y;
     width = vblit->source.d.x - vblit->source.a.x;
@@ -814,12 +819,12 @@ gst_c2d_update_object (C2D_OBJECT * object, const guint surface_id,
   // Apply the flip bits to the object configure mask if set.
   object->config_mask &= ~(C2D_MIRROR_V_BIT | C2D_MIRROR_H_BIT);
 
-  if (vblit->mask & GST_VCE_MASK_FLIP_VERTICAL) {
+  if (vblit->mask & GST_VIDEO_CONVERTER_MASK_FLIP_VERTICAL) {
     object->config_mask |= C2D_MIRROR_V_BIT;
     GST_TRACE ("Input surface %x - Flip Vertically", surface_id);
   }
 
-  if (vblit->mask & GST_VCE_MASK_FLIP_HORIZONTAL) {
+  if (vblit->mask & GST_VIDEO_CONVERTER_MASK_FLIP_HORIZONTAL) {
     object->config_mask |= C2D_MIRROR_H_BIT;
     GST_TRACE ("Input surface %x - Flip Horizontally", surface_id);
   }
@@ -828,7 +833,7 @@ gst_c2d_update_object (C2D_OBJECT * object, const guint surface_id,
   x = y = width = height = 0;
 
   // Setup the target rectangle.
-  if (vblit->mask & GST_VCE_MASK_DESTINATION) {
+  if (vblit->mask & GST_VIDEO_CONVERTER_MASK_DESTINATION) {
     x = vblit->destination.x;
     y = vblit->destination.y;
     width = vblit->destination.w;
@@ -837,7 +842,7 @@ gst_c2d_update_object (C2D_OBJECT * object, const guint surface_id,
 
   // Setup rotation angle and adjustments.
   switch (rotate) {
-    case GST_VCE_ROTATE_90:
+    case GST_VIDEO_ROTATE_90_CW:
     {
       gint dar_n = 0, dar_d = 0;
 
@@ -870,7 +875,7 @@ gst_c2d_update_object (C2D_OBJECT * object, const guint surface_id,
       object->target_rect.x = y << 16;
       break;
     }
-    case GST_VCE_ROTATE_180:
+    case GST_VIDEO_ROTATE_180:
       object->config_mask |= (C2D_OVERRIDE_GLOBAL_TARGET_ROTATE_CONFIG |
           C2D_OVERRIDE_TARGET_ROTATE_180);
       GST_LOG ("Input surface %x - rotate 180°", surface_id);
@@ -888,7 +893,7 @@ gst_c2d_update_object (C2D_OBJECT * object, const guint surface_id,
       object->target_rect.y =
           (GST_VIDEO_FRAME_HEIGHT (outframe) - (y + height)) << 16;
       break;
-    case GST_VCE_ROTATE_270:
+    case GST_VIDEO_ROTATE_90_CCW:
     {
       gint dar_n = 0, dar_d = 0;
 
@@ -1020,7 +1025,6 @@ gst_c2d_video_converter_compose (GstC2dVideoConverter * convert,
     GstVideoComposition * compositions, guint n_compositions, gpointer * fence)
 {
   GArray *requests = NULL;
-  GstC2dRequest *request = NULL;
   C2D_OBJECT objects[GST_C2D_MAX_DRAW_OBJECTS] = { 0, };
   guint idx = 0, num = 0, surface_id = 0, area = 0;
   C2D_STATUS status = C2D_STATUS_OK;
@@ -1036,29 +1040,23 @@ gst_c2d_video_converter_compose (GstC2dVideoConverter * convert,
       gst_c2d_compare_compositions);
 
   for (idx = 0; idx < n_compositions; idx++) {
-    GstVideoComposition *composition = NULL;
-    GstVideoFrame *outframe = g_slice_new0 (GstVideoFrame);
-    GstVideoBlit *blits = NULL, l_blit = GST_VCE_BLIT_INIT;
+    GstVideoComposition *composition = &(compositions[idx]);
+    GstC2dRequest *request = &g_array_index (requests, GstC2dRequest, idx);
+    GstVideoFrame *inframe = NULL, *outframe = NULL;
+    GstVideoBlit l_blit = GST_VIDEO_BLIT_INIT;
     guint n_blits = 0, n_objects = 0;
     gboolean optimized = FALSE;
-    request = &g_array_index (requests, GstC2dRequest, idx);
-
-    composition = &(compositions[idx]);
-
-    request->inframes = g_array_sized_new(FALSE, FALSE, sizeof(GstVideoFrame),
-        composition->n_blits);
-    g_array_set_size (request->inframes, composition->n_blits);
 
     // Sanity checks, output frame and blit entries must not be NULL.
     g_return_val_if_fail (composition->buffer != NULL, FALSE);
     g_return_val_if_fail (composition->blits != NULL, FALSE);
-    g_return_val_if_fail (composition->n_blits != 0, FALSE);
 
+    outframe = request->frame = g_slice_new0 (GstVideoFrame);
     success = gst_video_frame_map (outframe, composition->info,
         composition->buffer, GST_MAP_READ | GST_VIDEO_FRAME_MAP_FLAG_NO_REF);
 
     if (!success) {
-      GST_ERROR ("Failed to map input buffer!");
+      GST_ERROR ("Failed to map output buffer!");
       goto cleanup;
     }
 
@@ -1066,8 +1064,11 @@ gst_c2d_video_converter_compose (GstC2dVideoConverter * convert,
     // If a suitable composition is found then the local blit enry is filled.
     optimized = gst_c2d_optimize_composition (&l_blit, compositions, idx);
 
-    blits = optimized ? (&l_blit) : composition->blits;
-    n_blits = optimized ? 1 : composition->n_blits;
+    n_blits = optimized ? 1 : gst_video_blits_size (composition->blits);
+
+    request->inframes =
+        g_array_sized_new(FALSE, FALSE, sizeof (GstVideoFrame), n_blits);
+    g_array_set_size (request->inframes, n_blits);
 
     // Total area of the output frame that is to be used in later calculations
     // to determine whether there are unoccupied background pixels to be filled.
@@ -1075,9 +1076,10 @@ gst_c2d_video_converter_compose (GstC2dVideoConverter * convert,
 
     // Iterate over the input blit entries and update each C2D_OBJECT for draw.
     for (num = 0; num < n_blits; num++) {
-      GstVideoBlit *blit = &(blits[num]);
-      GstVideoFrame* inframe =
-          &g_array_index(request->inframes, GstVideoFrame, num);
+      GstVideoBlit *blit = optimized ?
+          &l_blit : gst_video_blits_entry (composition->blits, num);
+
+      inframe = &g_array_index (request->inframes, GstVideoFrame, num);
 
       GST_C2D_LOCK (convert);
 
@@ -1100,7 +1102,7 @@ gst_c2d_video_converter_compose (GstC2dVideoConverter * convert,
         goto cleanup;
       }
 
-      if ((blit->mask & GST_VCE_MASK_SOURCE) &&
+      if ((blit->mask & GST_VIDEO_CONVERTER_MASK_SOURCE) &&
           !gst_video_quadrilateral_is_rectangle (&(blit->source))) {
         GST_ERROR ("Composition %u: Blit %u: Source quadrilateral is not a "
             "rectangle! A(%f, %f) B(%f, %f) C(%f, %f) D(%f, %f)", idx, num,
@@ -1156,9 +1158,7 @@ gst_c2d_video_converter_compose (GstC2dVideoConverter * convert,
     }
 
     request->id = surface_id;
-
-    request->frame = outframe;
-    request->flags = composition->datatype;
+    request->datatype = composition->datatype;
 
     memcpy (request->offsets, composition->offsets, sizeof (request->offsets));
     memcpy (request->scales, composition->scales, sizeof (request->scales));
@@ -1204,7 +1204,7 @@ gst_c2d_video_converter_wait_fence (GstC2dVideoConverter * convert,
 
     GST_LOG ("Finished waiting surface_id: %x", request->id);
 
-    success &= gst_video_frame_normalize_ip (request->frame, request->flags,
+    success &= gst_video_frame_normalize_ip (request->frame, request->datatype,
         request->offsets, request->scales);
   }
 

@@ -21,6 +21,7 @@
 #define MMM_COLOR_FMT_NV12_UBWC        COLOR_FMT_NV12_UBWC
 #define MMM_COLOR_FMT_NV12_BPP10_UBWC  COLOR_FMT_NV12_BPP10_UBWC
 #define MMM_COLOR_FMT_P010             COLOR_FMT_P010
+#define MMM_COLOR_FMT_P010_512         COLOR_FMT_P010_512
 #define MMM_COLOR_FMT_Y_META_STRIDE    VENUS_Y_META_STRIDE
 #define MMM_COLOR_FMT_Y_META_SCANLINES VENUS_Y_META_SCANLINES
 #define MMM_COLOR_FMT_Y_SCANLINES      VENUS_Y_SCANLINES
@@ -55,7 +56,7 @@ static const std::unordered_map<uint32_t, C2Param::Index> kParamIndexMap = {
       C2StreamSyncFrameIntervalTuning::output::PARAM_TYPE },
   { GST_C2_PARAM_INTRA_REFRESH_TUNING,
       C2StreamIntraRefreshTuning::output::PARAM_TYPE },
-#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR == 1)
+#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
   { GST_C2_PARAM_INTRA_REFRESH_MODE,
       qc2::C2VideoIntraRefreshType::output::PARAM_TYPE },
 #endif // CODEC2_CONFIG_VERSION_MAJOR
@@ -98,6 +99,10 @@ static const std::unordered_map<uint32_t, C2Param::Index> kParamIndexMap = {
 #endif // CODEC2_CONFIG_VERSION_MAJOR
   { GST_C2_PARAM_ROI_ENCODE,
       qc2::QC2VideoROIRegionInfo::output::PARAM_TYPE },
+#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
+  { GST_C2_PARAM_ROI_MBMAP_INFO,
+      qc2::QC2VideoROIMbmapInfo::input::PARAM_TYPE },
+#endif // (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
   { GST_C2_PARAM_TRIGGER_SYNC_FRAME,
       C2StreamRequestSyncFrameTuning::output::PARAM_TYPE },
   { GST_C2_PARAM_PRIORITY,
@@ -116,7 +121,7 @@ static const std::unordered_map<uint32_t, C2Param::Index> kParamIndexMap = {
 #if (CODEC2_CONFIG_VERSION_MINOR == 0)
   { GST_C2_PARAM_VUI_TIMING_INFO,
       qc2::QC2VideoVuiTimingInfo::output::PARAM_TYPE },
-#elif (CODEC2_CONFIG_VERSION_MINOR == 1)
+#elif (CODEC2_CONFIG_VERSION_MINOR >= 1)
   { GST_C2_PARAM_VUI_TIMING_INFO,
       qc2::C2VuiTimingInfo::output::PARAM_TYPE },
 #endif // CODEC2_CONFIG_VERSION_MINOR
@@ -149,12 +154,20 @@ static const std::unordered_map<uint32_t, C2Param::Index> kParamIndexMap = {
       qc2::C2VideoMirrorTuning::input::PARAM_TYPE },
   { GST_C2_PARAM_VBV_DELAY,
       qc2::C2VBVDelayTuning::input::PARAM_TYPE },
-#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR == 1)
+#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
   { GST_C2_PARAM_HDR_MODE,
       C2StreamHdrFormatInfo::output::PARAM_TYPE },
-#endif // (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR == 1)
+#endif // (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
   { GST_C2_PARAM_NAL_LENGTH_BITSTREAM,
       qc2::C2VideoNalLengthBitStream::output::PARAM_TYPE },
+  { GST_C2_PARAM_BITRATE_BOOST_MARGIN,
+      qc2::C2VideoBitrateboostMargin::output::PARAM_TYPE },
+#if ((CODEC2_CONFIG_VERSION_MAJOR == 2) && (CODEC2_CONFIG_VERSION_MINOR >= 2))
+  { GST_C2_PARAM_ENCODING_MODE,
+      qc2::C2VideoEncodingMode::output::PARAM_TYPE },
+#endif // ((CODEC2_CONFIG_VERSION_MAJOR == 2) && (CODEC2_CONFIG_VERSION_MINOR >= 2))
+  { GST_C2_PARAM_CAC,
+      qc2::C2VideoContentAdaptiveCoding::output::PARAM_TYPE },
 };
 
 // Convenient map for printing the engine parameter name in string form.
@@ -187,6 +200,7 @@ static const std::unordered_map<uint32_t, const char*> kParamNameMap = {
   { GST_C2_PARAM_CHROMA_QP_OFFSET, "CHROMA_QP_OFFSET" },
   { GST_C2_PARAM_QP_RANGES, "QP_RANGES" },
   { GST_C2_PARAM_ROI_ENCODE, "ROI_ENCODE" },
+  { GST_C2_PARAM_ROI_MBMAP_INFO, "ROI_MBMAP_INFO" },
   { GST_C2_PARAM_TRIGGER_SYNC_FRAME, "TRIGGER_SYNC_FRAME" },
   { GST_C2_PARAM_NATIVE_RECORDING, "NATIVE_RECORDING" },
   { GST_C2_PARAM_TEMPORAL_LAYERING, "TEMPORAL_LAYERING" },
@@ -213,11 +227,14 @@ static const std::unordered_map<uint32_t, const char*> kParamNameMap = {
   { GST_C2_PARAM_VBV_DELAY, "VBV_DELAY" },
   { GST_C2_PARAM_VUI_TIMING_INFO, "VUI_TIMING_INFO" },
   { GST_C2_PARAM_HDR_MODE, "HDR_MODE" },
+  { GST_C2_PARAM_BITRATE_BOOST_MARGIN, "BITRATE_BOOST_MARGIN" },
   { GST_C2_PARAM_NAL_LENGTH_BITSTREAM, "NAL_LENGTH_BITSTREAM" },
+  { GST_C2_PARAM_ENCODING_MODE, "ENCODING_MODE"},
+  { GST_C2_PARAM_CAC, "CAC"},
 };
 
 // Map for the GST_C2_PARAM_PROFILE_LEVEL parameter.
-static const std::unordered_map<uint32_t, C2Config::profile_t> kProfileMap = {
+static const std::unordered_map<uint32_t, uint32_t> kProfileMap = {
   { GST_C2_PROFILE_AVC_BASELINE,
       C2Config::profile_t::PROFILE_AVC_BASELINE },
   { GST_C2_PROFILE_AVC_CONSTRAINED_BASELINE,
@@ -234,6 +251,10 @@ static const std::unordered_map<uint32_t, C2Config::profile_t> kProfileMap = {
       C2Config::profile_t::PROFILE_HEVC_MAIN_10 },
   { GST_C2_PROFILE_HEVC_MAIN_STILL,
       C2Config::profile_t::PROFILE_HEVC_MAIN_STILL },
+#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
+  { GST_C2_PROFILE_HEVC_MAIN10_STILL,
+      qc2::HEVC_PROFILE_MAIN10_STILL_PIC },
+#endif // (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
   { GST_C2_PROFILE_AAC_LC,
       C2Config::profile_t::PROFILE_AAC_LC },
   { GST_C2_PROFILE_AAC_MAIN,
@@ -320,7 +341,7 @@ static const std::unordered_map<uint32_t, uint32_t> kRateCtrlMap = {
 // GST_C2_PARAM_INTRA_REFRESH_MODE parameter.
 static const std::unordered_map<uint32_t, uint32_t> kIntraRefreshMap = {
   { GST_C2_INTRA_REFRESH_DISABLED,  C2Config::INTRA_REFRESH_DISABLED },
-#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR == 1)
+#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
   { GST_C2_INTRA_REFRESH_ARBITRARY, qc2::IntraRefreshMode::INTRA_REFRESH_RANDOM },
   { GST_C2_INTRA_REFRESH_CYCLIC,    qc2::IntraRefreshMode::INTRA_REFRESH_CYCLIC },
 #else
@@ -447,12 +468,30 @@ static const std::unordered_map<uint32_t, qc2::QCMirrorType> kFlipMap = {
 
 // Map for the GST_C2_HDR_MODE parameter.
 static const std::unordered_map<uint32_t, uint32_t> kHdrMap = {
-#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR == 1)
+#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
   { GST_C2_HDR_NONE,       C2Config::hdr_format_t::SDR },
   { GST_C2_HDR_HLG,        C2Config::hdr_format_t::HLG },
   { GST_C2_HDR_HDR10,      C2Config::hdr_format_t::HDR10 },
   { GST_C2_HDR_HDR10_PLUS, C2Config::hdr_format_t::HDR10_PLUS },
 #endif // CODEC2_CONFIG_VERSION_MAJOR
+};
+
+#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 2)
+// Map for the GstC2EncodingMode.
+static const std::unordered_map<uint32_t, qc2::QcEncodingMode> kEncodingModeMap = {
+  { GST_C2_ENCODING_MODE_DEFAULT,   QcDefault },
+  { GST_C2_ENCODING_MODE_PROSIGHT,  QcProsight },
+  { GST_C2_ENCODING_MODE_DEPTH,     QcDepth },
+  { GST_C2_ENCODING_MODE_LOOKAHEAD, QcLookahead },
+};
+#endif // (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 2)
+
+// Map for the GstC2Cac.
+static const std::unordered_map<uint32_t, int32_t> kCacMap = {
+  { GST_C2_CAC_DISABLE_ALL,  0 },
+  { GST_C2_CAC_ENABLE_8BIT,  1 },
+  { GST_C2_CAC_ENABLE_10BIT, 2 },
+  { GST_C2_CAC_ENABLE_ALL,   3 },
 };
 
 C2Param::Index GstC2Utils::ParamIndex(uint32_t type) {
@@ -657,7 +696,8 @@ bool GstC2Utils::UnpackPayload(uint32_t type, void* payload,
       uint32_t level = ((*reinterpret_cast<guint32*>(payload)) >> 16) & 0xFFFF;
 
       if (profile != GST_C2_PROFILE_INVALID) {
-        plinfo.profile = kProfileMap.at(profile);
+        plinfo.profile =
+            static_cast<C2Config::profile_t>(kProfileMap.at(profile));
       }
       if (level != GST_C2_LEVEL_INVALID) {
         plinfo.level = kLevelMap.at(level);
@@ -709,7 +749,7 @@ bool GstC2Utils::UnpackPayload(uint32_t type, void* payload,
       c2param = C2Param::Copy(irefresh);
       break;
     }
-#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR == 1)
+#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
     case GST_C2_PARAM_INTRA_REFRESH_MODE: {
       qc2::C2VideoIntraRefreshType::output ir_type;
       uint32_t mode = *(reinterpret_cast<guint32*>(payload));
@@ -924,6 +964,37 @@ bool GstC2Utils::UnpackPayload(uint32_t type, void* payload,
       c2param = C2Param::Copy(region);
       break;
     }
+#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
+    case GST_C2_PARAM_ROI_MBMAP_INFO: {
+      GstC2QuantMbmapInfo *mb_map =
+          reinterpret_cast<GstC2QuantMbmapInfo*>(payload);
+      // Config only case, alloc qp_bias_map size as 1
+      const uint32_t total_mbs = std::max<uint32_t>(1u, mb_map->total_mbs);
+      auto c2_mb_map = qc2::QC2VideoROIMbmapInfo::input::AllocUnique(
+          static_cast<unsigned long>(total_mbs));
+
+      c2_mb_map->m.enable = mb_map->enable;
+
+      // Only fill qp bias map for valid mbs(none config only case)
+      if (mb_map->enable && mb_map->total_mbs > 0 &&
+          mb_map->qp_bias_map != NULL) {
+        uint8_t *pdata =
+            reinterpret_cast<uint8_t *>(&(c2_mb_map->m.qp_bias_map[0]));
+        c2_mb_map->m.mb_side_length =
+            static_cast<int32_t>(mb_map->mb_side_length);
+
+        for (uint32_t i = 0; i < total_mbs; i++) {
+          int32_t src_qp = static_cast<int32_t>(
+              g_array_index(mb_map->qp_bias_map, gint8, i));
+          pdata[i] = static_cast<uint8_t>(src_qp + static_cast<int32_t>(
+              qc2::C2VideoROIMbmapInfoStruct::QP_DELTA_OFFSET));
+        }
+      }
+
+      c2param = C2Param::Copy(*c2_mb_map);
+      break;
+    }
+#endif // (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
     case GST_C2_PARAM_TRIGGER_SYNC_FRAME: {
       C2StreamRequestSyncFrameTuning::output syncframe;
       gboolean enable = *(reinterpret_cast<gboolean*>(payload));
@@ -997,7 +1068,7 @@ bool GstC2Utils::UnpackPayload(uint32_t type, void* payload,
     case GST_C2_PARAM_VUI_TIMING_INFO: {
 #if (CODEC2_CONFIG_VERSION_MINOR == 0)
       qc2::QC2VideoVuiTimingInfo::output timing;
-#elif (CODEC2_CONFIG_VERSION_MINOR == 1)
+#elif (CODEC2_CONFIG_VERSION_MINOR >= 1)
       qc2::C2VuiTimingInfo::output timing;
 #endif // CODEC2_CONFIG_VERSION_MINOR
 
@@ -1110,7 +1181,7 @@ bool GstC2Utils::UnpackPayload(uint32_t type, void* payload,
       c2param = C2Param::Copy(delay);
       break;
     }
-#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR == 1)
+#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
     case GST_C2_PARAM_HDR_MODE: {
       C2StreamHdrFormatInfo::output hdrmode;
       uint32_t mode = *(reinterpret_cast<GstC2HdrMode*>(payload));
@@ -1125,6 +1196,31 @@ bool GstC2Utils::UnpackPayload(uint32_t type, void* payload,
 
       nallen.num_bytes = *(reinterpret_cast<guint32*>(payload));
       c2param = C2Param::Copy(nallen);
+      break;
+    }
+    case GST_C2_PARAM_BITRATE_BOOST_MARGIN: {
+      qc2::C2VideoBitrateboostMargin::output margin;
+
+      margin.value = *(reinterpret_cast<gint32*>(payload));
+      c2param = C2Param::Copy(margin);
+      break;
+    }
+#if ((CODEC2_CONFIG_VERSION_MAJOR == 2) && (CODEC2_CONFIG_VERSION_MINOR >= 2))
+    case GST_C2_PARAM_ENCODING_MODE: {
+      qc2::C2VideoEncodingMode::output encodingmode;
+      uint32_t mode = *(reinterpret_cast<GstC2EncodingMode*>(payload));
+
+      encodingmode.value = kEncodingModeMap.at(mode);
+      c2param = C2Param::Copy(encodingmode);
+      break;
+    }
+#endif // ((CODEC2_CONFIG_VERSION_MAJOR == 2) && (CODEC2_CONFIG_VERSION_MINOR >= 2))
+    case GST_C2_PARAM_CAC: {
+      qc2::C2VideoContentAdaptiveCoding::output cac;
+      uint32_t mode = *(reinterpret_cast<GstC2Cac*>(payload));
+
+      cac.value = kCacMap.at(mode);
+      c2param = C2Param::Copy(cac);
       break;
     }
     default:
@@ -1260,7 +1356,7 @@ bool GstC2Utils::PackPayload(uint32_t type, std::unique_ptr<C2Param>& c2param,
       reinterpret_cast<GstC2IntraRefresh*>(payload)->period = irefresh->period;
       break;
     }
-#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR == 1)
+#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
     case GST_C2_PARAM_INTRA_REFRESH_MODE: {
       auto ir_type =
           reinterpret_cast<qc2::C2VideoIntraRefreshType::output*>(c2param.get());
@@ -1437,6 +1533,12 @@ bool GstC2Utils::PackPayload(uint32_t type, std::unique_ptr<C2Param>& c2param,
       /// TODO
       break;
     }
+#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
+    case GST_C2_PARAM_ROI_MBMAP_INFO: {
+      /// TODO
+      break;
+    }
+#endif // (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
     case GST_C2_PARAM_TRIGGER_SYNC_FRAME: {
       auto syncframe =
           reinterpret_cast<C2StreamRequestSyncFrameTuning::output*>(c2param.get());
@@ -1470,7 +1572,7 @@ bool GstC2Utils::PackPayload(uint32_t type, std::unique_ptr<C2Param>& c2param,
 #if (CODEC2_CONFIG_VERSION_MINOR == 0)
       auto timing = reinterpret_cast<
           qc2::QC2VideoVuiTimingInfo::output*>(c2param.get());
-#elif (CODEC2_CONFIG_VERSION_MINOR == 1)
+#elif (CODEC2_CONFIG_VERSION_MINOR >= 1)
       auto timing = reinterpret_cast<
           qc2::C2VuiTimingInfo::output*>(c2param.get());
 #endif // CODEC2_CONFIG_VERSION_MINOR
@@ -1595,7 +1697,7 @@ bool GstC2Utils::PackPayload(uint32_t type, std::unique_ptr<C2Param>& c2param,
       *(reinterpret_cast<gint32*>(payload)) = delay->value;
       break;
     }
-#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR == 1)
+#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
     case GST_C2_PARAM_HDR_MODE: {
       auto hdrmode =
           reinterpret_cast<C2StreamHdrFormatInfo::output*>(c2param.get());
@@ -1613,6 +1715,43 @@ bool GstC2Utils::PackPayload(uint32_t type, std::unique_ptr<C2Param>& c2param,
           reinterpret_cast<qc2::C2VideoNalLengthBitStream::output*>(c2param.get());
 
       *(reinterpret_cast<guint32*>(payload)) = nallen->num_bytes;
+      break;
+    }
+    case GST_C2_PARAM_BITRATE_BOOST_MARGIN: {
+      auto margin =
+          reinterpret_cast<qc2::C2VideoBitrateboostMargin::output*>(c2param.get());
+
+      *(reinterpret_cast<gint32*>(payload)) = margin->value;
+      break;
+    }
+#if ((CODEC2_CONFIG_VERSION_MAJOR == 2) && (CODEC2_CONFIG_VERSION_MINOR >= 2))
+    case GST_C2_PARAM_ENCODING_MODE: {
+      auto encodingmode =
+          reinterpret_cast<qc2::C2VideoEncodingMode::output*>(c2param.get());
+
+      auto result = std::find_if(kEncodingModeMap.begin(), kEncodingModeMap.end(),
+          [&](const auto& m) { return m.second == encodingmode->value; });
+
+      if (result != kEncodingModeMap.end()) {
+        *(reinterpret_cast<GstC2EncodingMode*>(payload)) =
+            static_cast<GstC2EncodingMode>(result->first);
+      } else {
+        GST_ERROR("Unsupported option for encoding mode!");
+        return FALSE;
+      }
+      break;
+    }
+#endif // ((CODEC2_CONFIG_VERSION_MAJOR == 2) && (CODEC2_CONFIG_VERSION_MINOR >= 2))
+    case GST_C2_PARAM_CAC: {
+      auto cac = reinterpret_cast<qc2::C2VideoContentAdaptiveCoding::output*>(
+          c2param.get());
+
+      auto result = std::find_if(kCacMap.begin(), kCacMap.end(),
+          [&](const auto& m) { return m.second == cac->value; });
+
+      *(reinterpret_cast<GstC2Cac*>(payload)) =
+          static_cast<GstC2Cac>(result->first);
+
       break;
     }
     default:
@@ -1723,9 +1862,21 @@ bool GstC2Utils::ImportHandleInfo(GstBuffer* buffer,
       break;
 #endif // GBM_FORMAT_NV12_UBWC_FLEX
     case C2PixelFormat::kP010:
-      handle->mInts.format = GBM_FORMAT_YCbCr_420_P010_VENUS;
-      handle->mInts.slice_height =
-          MMM_COLOR_FMT_Y_SCANLINES(MMM_COLOR_FMT_P010, height);
+      if (GST_BUFFER_FLAG_IS_SET (buffer, GST_VIDEO_BUFFER_FLAG_HEIC)) {
+#if defined(GBM_FORMAT_YCbCr_420_P010_512) && defined(GBM_BO_USAGE_PRIVATE_HEIF_P010)
+        handle->mInts.format = GBM_FORMAT_YCbCr_420_P010_512;
+        handle->mInts.usage_lo |= GBM_BO_USAGE_PRIVATE_HEIF_P010;
+        handle->mInts.slice_height =
+            MMM_COLOR_FMT_Y_SCANLINES(MMM_COLOR_FMT_P010_512, height);
+#else
+        GST_ERROR ("P010 HEIF is not supported in GBM!");
+        return false;
+#endif  // (GBM_FORMAT_YCbCr_420_P010_512 && GBM_BO_USAGE_PRIVATE_HEIF_P010)
+      } else {
+        handle->mInts.format = GBM_FORMAT_YCbCr_420_P010_VENUS;
+        handle->mInts.slice_height =
+            MMM_COLOR_FMT_Y_SCANLINES(MMM_COLOR_FMT_P010, height);
+      }
       break;
 #ifdef GBM_FORMAT_YCbCr_420_P010_FLEX
     case C2PixelFormat::kP010_FLEX:

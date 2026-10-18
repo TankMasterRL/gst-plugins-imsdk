@@ -12,6 +12,7 @@
 #include <gst/utils/common-utils.h>
 
 
+GST_DEBUG_CATEGORY_EXTERN (gst_video_converter_engine_debug);
 #define GST_CAT_DEFAULT gst_video_converter_engine_debug
 
 #define LOAD_FCV_SYMBOL(c, name) \
@@ -33,6 +34,10 @@
         s_rgb->stride, d_grayscale->data,  d_grayscale->stride)
 #define GST_FCV_RGB_TO_YUV(c, in, out, s_rgb, d_luma, d_chroma)         \
     c->Color##in##ToYCbCr##out##PseudoPlanaru8 (                        \
+        s_rgb->data, s_rgb->width, s_rgb->height, s_rgb->stride,        \
+        d_luma->data, d_chroma->data, d_luma->stride, d_chroma->stride)
+#define GST_FCV_RGBA_TO_NV12(c, s_rgb, d_luma, d_chroma)                \
+    c->ColorRGBA8888ToYCbCr420PseudoPlanaru8 (                          \
         s_rgb->data, s_rgb->width, s_rgb->height, s_rgb->stride,        \
         d_luma->data, d_chroma->data, d_luma->stride, d_chroma->stride)
 #define GST_FCV_RGB_TO_RGB(c, in, out, s_rgb, d_rgb)                     \
@@ -357,6 +362,11 @@ struct _GstFcvVideoConverter
       const uint8_t *__restrict source, uint32_t s_width, uint32_t s_height,
       uint32_t s_stride, uint8_t *__restrict destination, uint32_t d_stride);
 
+  FASTCV_API void (*ColorRGBA8888ToYCbCr420PseudoPlanaru8) (
+      const uint8_t *__restrict src, uint32_t src_width, uint32_t src_height,
+      uint32_t src_stride, uint8_t *__restrict dst_y, uint8_t *__restrict dst_c,
+      uint32_t dst_y_stride, uint32_t dst_c_stride);
+
   FASTCV_API void (*ColorRGBA8888ToBGRA8888u8) (
       const uint8_t *__restrict source, uint32_t s_width, uint32_t s_height,
       uint32_t s_stride, uint8_t *__restrict destination, uint32_t d_stride);
@@ -398,34 +408,6 @@ load_symbol (gpointer* method, gpointer handle, const gchar* name)
   return TRUE;
 }
 
-GType
-gst_fcv_op_mode_get_type (void)
-{
-  static GType gtype = 0;
-  static const GEnumValue variants[] = {
-    { GST_FCV_OP_MODE_LOW_POWER,
-        "Uses lowest power consuming implementation", "low-power"
-    },
-    { GST_FCV_OP_MODE_PERFORMANCE,
-        "Uses highest performance implementation", "performance"
-    },
-    {
-      GST_FCV_OP_MODE_CPU_OFFLOAD,
-        "Uses highest performance implementation", "cpu-offload"
-    },
-    {
-      GST_FCV_OP_MODE_CPU_PERFORMANCE,
-        "Uses CPU highest performance implementation", "cpu-performance"
-    },
-    {0, NULL, NULL},
-  };
-
-  if (!gtype)
-      gtype = g_enum_register_static ("GstFcvOpMode", variants);
-
-  return gtype;
-}
-
 static inline gint
 gst_fcv_get_opmode (const GstStructure * settings)
 {
@@ -435,10 +417,10 @@ gst_fcv_get_opmode (const GstStructure * settings)
   gint mode = GST_FCV_OP_MODE_PERFORMANCE;
 
   if ((settings == NULL) ||
-      !gst_structure_has_field (settings, GST_VCE_OPT_FCV_OP_MODE))
+      !gst_structure_has_field (settings, GST_VIDEO_CONVERTER_OPT_FCV_OP_MODE))
     return mode;
 
-  value = gst_structure_get_value (settings, GST_VCE_OPT_FCV_OP_MODE);
+  value = gst_structure_get_value (settings, GST_VIDEO_CONVERTER_OPT_FCV_OP_MODE);
 
   if (G_VALUE_TYPE (value) == gst_fcv_op_mode_get_type ())
     return g_value_get_enum (value);
@@ -464,14 +446,14 @@ gst_fcv_stage_buffer_free (gpointer data)
 }
 
 static inline guint
-gst_fcv_translate_rotation (const GstVideoConvRotate rotate)
+gst_fcv_translate_rotation (const GstVideoRotate rotate)
 {
   switch (rotate) {
-    case GST_VCE_ROTATE_90:
+    case GST_VIDEO_ROTATE_90_CW:
       return FASTCV_ROTATE_90;
-    case GST_VCE_ROTATE_180:
+    case GST_VIDEO_ROTATE_180:
       return FASTCV_ROTATE_180;
-    case GST_VCE_ROTATE_270:
+    case GST_VIDEO_ROTATE_90_CCW:
       return FASTCV_ROTATE_270;
     default:
       break;
@@ -510,29 +492,29 @@ gst_fcv_regions_overlapping_area (GstVideoRectangle * l_rect,
 }
 
 static inline guint
-gst_fcv_composition_blit_area (GstVideoFrame * outframe, GstVideoBlit * blits,
+gst_fcv_composition_blit_area (GstVideoFrame * outframe, GstVideoBlits * blits,
     guint index)
 {
-  GstVideoBlit *blit = NULL;
-  GstVideoRectangle *region = NULL, *l_region = NULL;
+  GstVideoBlit *vblit = NULL;
+  GstVideoRectangle *region = NULL;
   guint num = 0, area = 0;
 
   // Fetch the blit at current index to which we will compare all others.
-  blit = &(blits[index]);
+  vblit = gst_video_blits_entry (blits, index);
 
   // If there are no destination region then the whole frame is the region.
-  if ((blit->destination.w == 0) || (blit->destination.h == 0))
+  if ((vblit->destination.w == 0) || (vblit->destination.h == 0))
     return GST_VIDEO_FRAME_WIDTH (outframe) * GST_VIDEO_FRAME_HEIGHT (outframe);
 
   // Calculate the destination area filled with frame content.
-  region = &(blit->destination);
+  region = &(vblit->destination);
   area = region->w * region->h;
 
   // Iterate destination region for each blit and subtract overlapping area.
   for (num = 0; num < index; num++) {
     // Subtract overlapping are of the destination regions in that blit object.
-    l_region = &(blits[num].destination);
-    area -= gst_fcv_regions_overlapping_area (region, l_region);
+    vblit = gst_video_blits_entry (blits, num);
+    area -= gst_fcv_regions_overlapping_area (region, &(vblit->destination));
   }
 
   return area;
@@ -558,7 +540,7 @@ gst_fcv_copy_object (GstFcvObject * l_object, GstFcvObject * r_object)
 static inline void
 gst_fcv_update_object (GstFcvObject * object, const gchar * type,
     const GstVideoFrame * frame, const GstVideoRectangle * region,
-    const guint flip, const guint rotate, const guint64 datatype)
+    const guint flip, const guint rotate, const GstVideoDataType datatype)
 {
   const gchar *mode = NULL;
   gint x = 0, y = 0, width = 0, height = 0, bpp = 0;
@@ -572,26 +554,7 @@ gst_fcv_update_object (GstFcvObject * object, const gchar * type,
   width = MIN (((region->x + region->w) - x), (width - x));
   height = MIN (((region->y + region->h) - y), (height - y));
 
-  if (datatype == GST_VCE_DATA_TYPE_I8)
-    mode = " INT8";
-  else if (datatype == GST_VCE_DATA_TYPE_U16)
-    mode = " UINT16";
-  else if (datatype == GST_VCE_DATA_TYPE_I16)
-    mode = " INT16";
-  else if (datatype == GST_VCE_DATA_TYPE_U32)
-    mode = " UINT32";
-  else if (datatype == GST_VCE_DATA_TYPE_I32)
-    mode = " INT32";
-  else if (datatype == GST_VCE_DATA_TYPE_U64)
-    mode = " UINT64";
-  else if (datatype == GST_VCE_DATA_TYPE_I64)
-    mode = " INT64";
-  else if (datatype == GST_VCE_DATA_TYPE_F16)
-    mode = " FLOAT16";
-  else if (datatype == GST_VCE_DATA_TYPE_F32)
-    mode = " FLOAT32";
-  else
-    mode = " UINT8";
+  mode = gst_video_data_type_to_string (datatype);
 
   GST_TRACE ("%s Buffer %p - %ux%u %s%s", type, frame->buffer,
       GST_VIDEO_FRAME_WIDTH (frame), GST_VIDEO_FRAME_HEIGHT (frame),
@@ -623,14 +586,7 @@ gst_fcv_update_object (GstFcvObject * object, const gchar * type,
 
   // Reduce object stride to equivalent UINT8 as engine cannot operate otherwise.
   // Normalization to end pixel type will be done after all other operations.
-  if (datatype == GST_VCE_DATA_TYPE_U16 || datatype == GST_VCE_DATA_TYPE_I16 ||
-      datatype == GST_VCE_DATA_TYPE_F16)
-    object->planes[0].stride /= 2;
-  else if (datatype == GST_VCE_DATA_TYPE_U32 || datatype == GST_VCE_DATA_TYPE_I32 ||
-      datatype == GST_VCE_DATA_TYPE_F32)
-    object->planes[0].stride /= 4;
-  else if (datatype == GST_VCE_DATA_TYPE_U64 || datatype == GST_VCE_DATA_TYPE_I64)
-    object->planes[0].stride /= 8;
+  object->planes[0].stride /= gst_video_data_type_get_size (datatype);
 
   object->planes[0].width = width;
   object->planes[0].height = height;
@@ -1414,6 +1370,26 @@ gst_fcv_video_converter_rgb_to_yuv (GstFcvVideoConverter * convert,
     case GST_VIDEO_FORMAT_BGR + (GST_VIDEO_FORMAT_NV24 << 16):
       GST_FCV_RGB_TO_YUV (convert, RGB888, 444, s_rgb, d_luma, d_chroma);
       break;
+    // RGBA8888/RGBx → NV12: use dedicated fcvColorRGBA8888ToYCbCr420PseudoPlanaru8
+    // BGRA8888/BGRx → NV21: same API (BGRA byte order matches RGBA convention)
+    case GST_VIDEO_FORMAT_RGBA + (GST_VIDEO_FORMAT_NV12 << 16):
+    case GST_VIDEO_FORMAT_RGBx + (GST_VIDEO_FORMAT_NV12 << 16):
+    case GST_VIDEO_FORMAT_BGRA + (GST_VIDEO_FORMAT_NV21 << 16):
+    case GST_VIDEO_FORMAT_BGRx + (GST_VIDEO_FORMAT_NV21 << 16):
+      GST_FCV_RGBA_TO_NV12 (convert, s_rgb, d_luma, d_chroma);
+      break;
+    // BGRA8888/BGRx → NV12: swap chroma then use same API
+    // RGBA8888/RGBx → NV21: swap chroma then use same API
+    case GST_VIDEO_FORMAT_BGRA + (GST_VIDEO_FORMAT_NV12 << 16):
+    case GST_VIDEO_FORMAT_BGRx + (GST_VIDEO_FORMAT_NV12 << 16):
+    case GST_VIDEO_FORMAT_RGBA + (GST_VIDEO_FORMAT_NV21 << 16):
+    case GST_VIDEO_FORMAT_RGBx + (GST_VIDEO_FORMAT_NV21 << 16):
+      // Fetch temporary local storage for the swapped destination chroma plane.
+      gst_fcv_video_converter_stage_plane_init (convert, &l_chroma,
+          d_chroma->width, d_chroma->height, d_chroma->stride);
+      d_chroma = &l_chroma;
+      GST_FCV_RGBA_TO_NV12 (convert, s_rgb, d_luma, d_chroma);
+      break;
     default:
       GST_ERROR ("Unsupported format conversion from '%s' to '%s'!",
           gst_video_format_to_string (s_obj->format),
@@ -1962,7 +1938,7 @@ gst_fcv_video_converter_flip (GstFcvVideoConverter * convert,
 
 static inline gboolean
 gst_fcv_video_converter_fill_background (GstFcvVideoConverter * convert,
-    GstVideoFrame * frame, guint32 color, guint64 flags)
+    GstVideoFrame * frame, guint32 color, GstVideoDataType datatype)
 {
   guint8 red = 0, green = 0, blue = 0, alpha = 0, luma = 0, cb = 0, cr = 0;
   guint32 luma10bit = 0, cbcr10bit = 0, bytedepth = 1;
@@ -1995,14 +1971,7 @@ gst_fcv_video_converter_fill_background (GstFcvVideoConverter * convert,
 
   // Reduce object stride to equivalent UINT8 as engine cannot operate otherwise.
   // Normalization to end pixel type will be done after all other operations.
-  if (flags == GST_VCE_DATA_TYPE_U16 || flags == GST_VCE_DATA_TYPE_I16 ||
-      flags == GST_VCE_DATA_TYPE_F16)
-    bytedepth = 2;
-  else if (flags == GST_VCE_DATA_TYPE_U32 || flags == GST_VCE_DATA_TYPE_I32 ||
-      flags == GST_VCE_DATA_TYPE_F32)
-    bytedepth = 4;
-  else if (flags == GST_VCE_DATA_TYPE_U64 || flags == GST_VCE_DATA_TYPE_I64)
-    bytedepth = 8;
+  bytedepth = gst_video_data_type_get_size (datatype);
 
   GST_TRACE ("Fill buffer %p with 0x%X - %ux%u %s", frame->buffer, color,
       GST_VIDEO_FRAME_WIDTH (frame), GST_VIDEO_FRAME_HEIGHT (frame),
@@ -2285,30 +2254,21 @@ gst_fcv_video_converter_compose (GstFcvVideoConverter * convert,
     GstVideoComposition * compositions, guint n_compositions, gpointer * fence)
 {
   GstFcvObject objects[GST_FCV_MAX_DRAW_OBJECTS] = { 0, };
-  guint32 idx = 0, num = 0, n_objects = 0, area = 0;
+  guint idx = 0, num = 0, n_objects = 0, area = 0, n_blits = 0;
   GArray *inframes = NULL;
   GstVideoFrame outframe = {0,};
-  GstVideoComposition *composition = NULL;
-
 
   // TODO: Implement async operations via threads.
   if (fence != NULL)
     GST_WARNING ("Asynchronous composition operations are not supported!");
 
   for (idx = 0; idx < n_compositions; idx++) {
-    composition = &(compositions[idx]);
-
-    inframes = g_array_sized_new(FALSE, FALSE, sizeof(GstVideoFrame),
-        composition->n_blits);
-    g_array_set_size (inframes, composition->n_blits);
-
-    GstVideoBlit *blits = composition->blits;
-    guint n_blits = composition->n_blits;
+    GstVideoComposition *composition = &(compositions[idx]);
     gboolean success = FALSE;
 
-    // Sanity checks, blit entries must not be NULL.
+    // Sanity checks, output frame and blit entries must not be NULL.
     g_return_val_if_fail (composition->buffer != NULL, FALSE);
-    g_return_val_if_fail ((blits != NULL) && (n_blits != 0), FALSE);
+    g_return_val_if_fail (composition->blits != NULL, FALSE);
 
     success = gst_video_frame_map (&outframe, composition->info,
         composition->buffer, GST_MAP_READWRITE | GST_VIDEO_FRAME_MAP_FLAG_NO_REF);
@@ -2318,17 +2278,21 @@ gst_fcv_video_converter_compose (GstFcvVideoConverter * convert,
       return FALSE;
     }
 
+    n_blits = gst_video_blits_size (composition->blits);
+    inframes = g_array_sized_new (FALSE, FALSE, sizeof (GstVideoFrame), n_blits);
+    g_array_set_size (inframes, n_blits);
+
     // Total area of the output frame that is to be used in later calculations
     // to determine whether there are unoccupied background pixels to be filled.
     area = GST_VIDEO_FRAME_WIDTH (&outframe) * GST_VIDEO_FRAME_HEIGHT (&outframe);
 
     // Iterate over the input blit entries and update each FCV object.
     for (num = 0; num < n_blits; num++) {
-      GstVideoBlit *blit = &(blits[num]);
+      GstVideoBlit *blit = gst_video_blits_entry (composition->blits, num);
+      GstVideoFrame *inframe = &g_array_index (inframes, GstVideoFrame, num);
       GstFcvObject *object = NULL;
       GstVideoRectangle rectangle = {0, 0, 0, 0};
       guint flip = 0, rotate = 0;
-      GstVideoFrame *inframe = &g_array_index(inframes, GstVideoFrame, num);
 
       success = gst_video_frame_map (inframe, blit->info, blit->buffer,
           GST_MAP_READ | GST_VIDEO_FRAME_MAP_FLAG_NO_REF);
@@ -2343,21 +2307,21 @@ gst_fcv_video_converter_compose (GstFcvVideoConverter * convert,
         return FALSE;
       }
 
-      if ((blit->mask & GST_VCE_MASK_FLIP_VERTICAL) &&
-          (blit->mask & GST_VCE_MASK_FLIP_HORIZONTAL))
+      if ((blit->mask & GST_VIDEO_CONVERTER_MASK_FLIP_VERTICAL) &&
+          (blit->mask & GST_VIDEO_CONVERTER_MASK_FLIP_HORIZONTAL))
         flip = FASTCV_FLIP_BOTH;
-      else if (blit->mask & GST_VCE_MASK_FLIP_VERTICAL)
+      else if (blit->mask & GST_VIDEO_CONVERTER_MASK_FLIP_VERTICAL)
         flip = FASTCV_FLIP_VERT;
-      else if (blit->mask & GST_VCE_MASK_FLIP_HORIZONTAL)
+      else if (blit->mask & GST_VIDEO_CONVERTER_MASK_FLIP_HORIZONTAL)
         flip = FASTCV_FLIP_HORIZ;
 
-      if (blit->mask & GST_VCE_MASK_ROTATION)
+      if (blit->mask & GST_VIDEO_CONVERTER_MASK_ROTATION)
         rotate = gst_fcv_translate_rotation (blit->rotate);
 
       // Intialization of the source FCV object.
       object = &(objects[n_objects]);
 
-      if (blit->mask & GST_VCE_MASK_SOURCE) {
+      if (blit->mask & GST_VIDEO_CONVERTER_MASK_SOURCE) {
         if (!gst_video_quadrilateral_is_rectangle (&(blit->source))) {
           GST_ERROR ("Composition %u: Blit %u: Source quadrilateral is not a "
               "rectangle! A(%f, %f) B(%f, %f) C(%fd, %f) D(%f, %f)", idx, num,
@@ -2384,7 +2348,7 @@ gst_fcv_video_converter_compose (GstFcvVideoConverter * convert,
       object = &(objects[n_objects + 1]);
 
       // Setup the source quadrilateral.
-      if (blit->mask & GST_VCE_MASK_DESTINATION) {
+      if (blit->mask & GST_VIDEO_CONVERTER_MASK_DESTINATION) {
         rectangle = blit->destination;
       } else {
         rectangle.x = rectangle.y = 0;
@@ -2397,7 +2361,7 @@ gst_fcv_video_converter_compose (GstFcvVideoConverter * convert,
 
       // Subtract blit area from total area.
       if (area != 0)
-        area -= gst_fcv_composition_blit_area (&outframe, blits, num);
+        area -= gst_fcv_composition_blit_area (&outframe, composition->blits, num);
 
       // Increment the objects counter by 2 for for Source/Destination pair.
       n_objects += 2;
@@ -2417,12 +2381,10 @@ gst_fcv_video_converter_compose (GstFcvVideoConverter * convert,
 
     for (num = 0; num < inframes->len; num++) {
       GstVideoFrame *inframe = &g_array_index (inframes, GstVideoFrame, num);
-
       gst_video_frame_unmap (inframe);
     }
 
     g_array_free (inframes, TRUE);
-
     gst_video_frame_unmap (&outframe);
 
     if (!success) {
@@ -2538,6 +2500,7 @@ gst_fcv_video_converter_new (GstStructure * settings)
   success &= LOAD_FCV_SYMBOL (convert, ColorRGB888ToBGR565u8);
   success &= LOAD_FCV_SYMBOL (convert, ColorRGB888ToBGRA8888u8);
 
+  success &= LOAD_FCV_SYMBOL (convert, ColorRGBA8888ToYCbCr420PseudoPlanaru8);
   success &= LOAD_FCV_SYMBOL (convert, ColorRGBA8888ToBGRA8888u8);
   success &= LOAD_FCV_SYMBOL (convert, ColorRGBA8888ToRGB565u8);
   success &= LOAD_FCV_SYMBOL (convert, ColorRGBA8888ToRGB888u8);

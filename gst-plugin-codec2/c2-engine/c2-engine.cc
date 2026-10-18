@@ -56,7 +56,10 @@ static G_DEFINE_QUARK (GstC2BufferQuark, gst_c2_buffer_qdata);
   g_mutex_unlock (&engine->lock); \
 }
 
-#define MAX_NUM_PENDING_WORK      (11)
+#define MAX_NUM_PENDING_WORK_VIDEO_ENCODE   (26)
+#define MAX_NUM_PENDING_WORK_VIDEO_DECODE   (11)
+#define MAX_NUM_PENDING_WORK_AUDIO_ENCODE   (11)
+#define MAX_NUM_PENDING_WORK_AUDIO_DECODE   (11)
 
 struct _GstC2Engine {
   /// Component name, used mainly for debugging.
@@ -70,6 +73,8 @@ struct _GstC2Engine {
   GMutex          lock;
   /// Tracking the number of pending frames.
   guint32         n_pending;
+  /// Maximum number of pending frames allowed before blocking.
+  guint32         max_pending_work;
   /// Condition signalled when pending frame has been processed.
   GCond           workdone;
 
@@ -268,7 +273,7 @@ class GstC2Notifier : public IC2Notifier {
 
 GstC2Engine *
 gst_c2_engine_new (const gchar * name, guint32 mode, GstC2Callbacks * callbacks,
-    gpointer userdata)
+    GstC2PoolType type, gpointer userdata)
 {
   GstC2Engine *engine = NULL;
 
@@ -284,18 +289,23 @@ gst_c2_engine_new (const gchar * name, guint32 mode, GstC2Callbacks * callbacks,
   switch (mode) {
     case GST_C2_MODE_VIDEO_ENCODE:
       component_mode = C2ModeType::kVideoEncode;
+      engine->max_pending_work = MAX_NUM_PENDING_WORK_VIDEO_ENCODE;
       break;
     case GST_C2_MODE_VIDEO_DECODE:
       component_mode = C2ModeType::kVideoDecode;
+      engine->max_pending_work = MAX_NUM_PENDING_WORK_VIDEO_DECODE;
       break;
     case GST_C2_MODE_AUDIO_ENCODE:
       component_mode = C2ModeType::kAudioEncode;
+      engine->max_pending_work = MAX_NUM_PENDING_WORK_AUDIO_ENCODE;
       break;
     case GST_C2_MODE_AUDIO_DECODE:
       component_mode = C2ModeType::kAudioDecode;
+      engine->max_pending_work = MAX_NUM_PENDING_WORK_AUDIO_DECODE;
       break;
     default:
       component_mode = C2ModeType::kVideoEncode;
+      engine->max_pending_work = MAX_NUM_PENDING_WORK_VIDEO_ENCODE;
       break;
   }
 
@@ -307,11 +317,32 @@ gst_c2_engine_new (const gchar * name, guint32 mode, GstC2Callbacks * callbacks,
     return NULL;
   }
 
+  C2Module::PoolType pool_type = C2Module::PoolType::kUnspecified;
+  switch (type) {
+    case GST_C2_POOL_TYPE_UNSPECIFIED:
+      pool_type = C2Module::PoolType::kUnspecified;
+      break;
+    case GST_C2_POOL_TYPE_DEFAULT_LINEAR:
+      pool_type = C2Module::PoolType::kDefaultLinear;
+      break;
+    case GST_C2_POOL_TYPE_DEFAULT_GRAPHIC:
+      pool_type = C2Module::PoolType::kDefaultGraphic;
+      break;
+    case GST_C2_POOL_TYPE_LINEAR_NON_CONTIGUOUS:
+      pool_type = C2Module::PoolType::kLinearNonContiguous;
+      break;
+    case GST_C2_POOL_TYPE_GRAPHIC_NON_CONTIGUOUS:
+      pool_type = C2Module::PoolType::kGraphicNonContiguous;
+      break;
+    default:
+      break;
+  }
+
   try {
     std::shared_ptr<IC2Notifier> notifier =
         std::make_shared<GstC2Notifier>(engine);
 
-    engine->c2module->Initialize (notifier);
+    engine->c2module->Initialize (notifier, pool_type);
   } catch (std::exception& e) {
     GST_ERROR ("Failed to initialize, error: '%s'!", e.what());
     gst_c2_engine_free (engine);
@@ -443,7 +474,7 @@ gst_c2_engine_drain (GstC2Engine * engine, gboolean eos)
   std::shared_ptr<C2Buffer> c2buffer;
   std::list<std::unique_ptr<C2Param>> settings;
 
-  uint64_t index = 0;
+  uint64_t index = 0xFFFFFFFDULL;
   uint64_t timestamp = 0;
   uint32_t flags = C2FrameData::FLAG_END_OF_STREAM;
 
@@ -486,7 +517,7 @@ gst_c2_engine_queue (GstC2Engine * engine, GstC2QueueItem * item)
   uint32_t n_subframes = item->n_subframes;
 
   // Check and wait in case maximum number of pending frames has been reached.
-  GST_C2_ENGINE_CHECK_AND_WAIT_PENDING_WORK (engine, MAX_NUM_PENDING_WORK);
+  GST_C2_ENGINE_CHECK_AND_WAIT_PENDING_WORK (engine, engine->max_pending_work);
 
   if (GST_C2_MODE_VIDEO_ENCODE (engine) && (gst_buffer_n_memory (buffer) > 0) &&
       gst_is_fd_memory (gst_buffer_peek_memory (buffer, 0))) {
@@ -571,12 +602,30 @@ gst_c2_engine_queue (GstC2Engine * engine, GstC2QueueItem * item)
   else if (GST_CLOCK_TIME_IS_VALID (GST_BUFFER_PTS (buffer)))
     timestamp = GST_TIME_AS_USECONDS (GST_BUFFER_PTS (buffer));
 
-  // Get per frame settings. TODO: Right now this is only ROI data.
+  // Get per frame settings.
   if (item->userdata) {
-    GstC2QuantRegions *roiparam = reinterpret_cast<GstC2QuantRegions*>(
-        item->userdata);
     std::unique_ptr<C2Param> c2param;
-    GstC2Utils::UnpackPayload(GST_C2_PARAM_ROI_ENCODE, roiparam, c2param);
+
+    switch (item->userdatatype) {
+      case GST_C2_USERDATA_TYPE_ROI_RECTANGLE: {
+        GstC2QuantRegions *roiparam =
+            reinterpret_cast<GstC2QuantRegions*>(item->userdata);
+        GstC2Utils::UnpackPayload(GST_C2_PARAM_ROI_ENCODE, roiparam, c2param);
+        break;
+      }
+      case GST_C2_USERDATA_TYPE_ROI_MB_MAP: {
+        GstC2QuantMbmapInfo *mbmapinfo =
+            reinterpret_cast<GstC2QuantMbmapInfo*>(item->userdata);
+        GstC2Utils::UnpackPayload(GST_C2_PARAM_ROI_MBMAP_INFO,
+            mbmapinfo, c2param);
+        break;
+      }
+      default:
+        GST_ERROR ("Invalid userdata type '%u'!",
+            static_cast<uint32_t>(item->userdatatype));
+        return FALSE;
+    }
+
     settings.push_back(std::move(c2param));
   }
 

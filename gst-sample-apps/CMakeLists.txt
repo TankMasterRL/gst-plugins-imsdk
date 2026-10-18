@@ -1,20 +1,45 @@
-# Add all immediate subdirectories automatically, except excluded ones
-file(GLOB SUBDIRS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} *)
-
-set(EXCLUDED_DIRS
-    gst-sample-apps-utils
+set(GST_CAMERA_SAMPLE_APPS
     gst-camera-fd-stream-example
-    gst-camera-metadata-example
     gst-camera-per-port-example
     gst-camera-burst-capture-example
-    gst-webrtc-sendrecv-example
+    gst-camera-metadata-example
 )
 
-foreach(subdir IN LISTS SUBDIRS)
-    if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${subdir}")
-        list(FIND EXCLUDED_DIRS "${subdir}" EXCLUDED_INDEX)
-        if(EXCLUDED_INDEX EQUAL -1)
-            add_subdirectory("${subdir}")
-        endif()
+if (ENABLE_GST_SAMPLE_APPS_CAMERA)
+  foreach(dir ${GST_CAMERA_SAMPLE_APPS})
+    if (IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${dir})
+      message(STATUS "Directory exists, adding subdirectory: ${dir}")
+      add_subdirectory(${dir})
+    else()
+      message(STATUS "Directory does NOT exist: ${CMAKE_CURRENT_SOURCE_DIR}/${dir}")
     endif()
-endforeach()
+  endforeach()
+else()
+  message(STATUS "ENABLE_GST_SAMPLE_APPS_CAMERA is disabled")
+endif()
+
+if (ENABLE_GST_SAMPLE_APPS)
+  file(GLOB GST_SAMPLE_APPS_DIRS
+       RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
+       gst-*
+       GstD-*)
+
+  foreach(dir ${GST_SAMPLE_APPS_DIRS})
+
+    if(NOT IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${dir})
+      continue()
+    endif()
+
+    list(FIND GST_CAMERA_SAMPLE_APPS ${dir} _camera_index)
+    if (_camera_index GREATER -1)
+      continue()
+    endif()
+
+    if (dir STREQUAL "gst-sample-apps-utils")
+      continue()
+    endif()
+
+    add_subdirectory(${dir})
+
+  endforeach()
+endif()

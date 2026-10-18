@@ -18,6 +18,20 @@ set(PYTHON_SCRIPTS
   gst-opencv-transform.py
   gst-parallel-inference.py
   gst-rtspsrc-detection-display.py
+  gst_utils.py
+  gst-video-source.py
+  gst-ai-audio-inference.py
+  gst-ai-audio-postprocess.py
+  gst-ai-audio-preprocess.py
+  gst-ai-video-classification.py
+  gst-ai-video-classification-and-detection.py
+  gst-ai-video-daisychain-pose-estimation.py
+  gst-ai-video-detection.py
+  gst-ai-video-inference.py
+  gst-ai-video-postprocess.py
+  gst-ai-video-preprocess.py
+  gst-ai-video-preprocess-crop.py
+  gst-ai-video-segmentation.py
 )
 
 set(QDEMO_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/files")
@@ -42,7 +56,7 @@ install(
   FILES
     ${QDEMO_ASSETS_DIR}/Qdemo.png
     ${QDEMO_ASSETS_DIR}/Qdemo.gif
-  DESTINATION ${GST_PLUGINS_QTI_OSS_INSTALL_MEDIA}
+  DESTINATION ${GST_PLUGINS_QTI_OSS_INSTALL_DATADIR}/qdemo
   PERMISSIONS OWNER_READ OWNER_WRITE
               GROUP_READ
               WORLD_READ

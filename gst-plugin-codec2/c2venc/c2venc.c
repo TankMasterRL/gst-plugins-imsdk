@@ -28,6 +28,8 @@ G_DEFINE_TYPE (GstC2VEncoder, gst_c2_venc, GST_TYPE_VIDEO_ENCODER);
 #define GST_TYPE_C2_VIDEO_ROTATION     (gst_c2_video_rotation_get_type())
 #define GST_TYPE_C2_VIDEO_FLIP         (gst_c2_video_flip_get_type())
 #define GST_TYPE_C2_HDR_MODE           (gst_c2_hdr_mode_get_type())
+#define GST_TYPE_C2_ENCODING_MODE      (gst_c2_encoding_mode_get_type())
+#define GST_TYPE_C2_CAC                (gst_c2_cac_get_type())
 
 #define DEFAULT_PROP_ROTATE               (GST_C2_ROTATE_NONE)
 #define DEFAULT_PROP_RATE_CONTROL         (GST_C2_RATE_CTRL_DISABLE)
@@ -36,14 +38,14 @@ G_DEFINE_TYPE (GstC2VEncoder, gst_c2_venc, GST_TYPE_VIDEO_ENCODER);
 #define DEFAULT_PROP_INTRA_REFRESH_MODE   (0xffffffff)
 #define DEFAULT_PROP_INTRA_REFRESH_PERIOD (0)
 #define DEFAULT_PROP_B_FRAMES             (0xffffffff)
-#define DEFAULT_PROP_QUANT_I_FRAMES       (0xffffffff)
-#define DEFAULT_PROP_QUANT_P_FRAMES       (0xffffffff)
-#define DEFAULT_PROP_QUANT_B_FRAMES       (0xffffffff)
-#define DEFAULT_PROP_MIN_QP_I_FRAMES      (10)
+#define DEFAULT_PROP_QUANT_I_FRAMES       (0x7fffffff)
+#define DEFAULT_PROP_QUANT_P_FRAMES       (0x7fffffff)
+#define DEFAULT_PROP_QUANT_B_FRAMES       (0x7fffffff)
+#define DEFAULT_PROP_MIN_QP_I_FRAMES      (0)
 #define DEFAULT_PROP_MAX_QP_I_FRAMES      (51)
-#define DEFAULT_PROP_MIN_QP_P_FRAMES      (10)
+#define DEFAULT_PROP_MIN_QP_P_FRAMES      (0)
 #define DEFAULT_PROP_MAX_QP_P_FRAMES      (51)
-#define DEFAULT_PROP_MIN_QP_B_FRAMES      (10)
+#define DEFAULT_PROP_MIN_QP_B_FRAMES      (0)
 #define DEFAULT_PROP_MAX_QP_B_FRAMES      (51)
 #define DEFAULT_PROP_ROI_QUANT_MODE       (FALSE)
 #define DEFAULT_PROP_ROI_QP_DELTA         (-15)
@@ -57,7 +59,11 @@ G_DEFINE_TYPE (GstC2VEncoder, gst_c2_venc, GST_TYPE_VIDEO_ENCODER);
 #define DEFAULT_PROP_FLIP                 (GST_C2_FLIP_NONE)
 #define DEFAULT_PROP_VBV_DELAY            (0x7fffffff)
 #define DEFAULT_PROP_HDR_MODE             (GST_C2_HDR_NONE)
+#define DEFAULT_PROP_MB_MAP_TOTAL_MBS     (0xffffffff)
 #define DEFAULT_PROP_CHROMA_QP_OFFSET     (0x7fffffff)
+#define DEFAULT_PROP_BITRATE_BOOST_MARGIN (0x7fffffff)
+#define DEFAULT_PROP_ENCODING_MODE        (GST_C2_ENCODING_MODE_DEFAULT)
+#define DEFAULT_PROP_CAC                  (GST_C2_CAC_DEFAULT)
 
 #define GST_VIDEO_FORMATS "{ NV12, P010_10LE, NV12_Q08C, NV12_Q10LE32C }"
 
@@ -83,6 +89,7 @@ enum
   PROP_ROI_QUANT_MODE,
   PROP_ROI_QUANT_META_VALUE,
   PROP_ROI_QUANT_BOXES,
+  PROP_ROI_MB_MAP_INFO,
   PROP_SLICE_MODE,
   PROP_SLICE_SIZE,
   PROP_ENTROPY_MODE,
@@ -93,7 +100,10 @@ enum
   PROP_FLIP,
   PROP_VBV_DELAY,
   PROP_HDR_MODE,
+  PROP_BITRATE_BOOST_MARGIN,
   PROP_CHROMA_QP_OFFSET,
+  PROP_ENCODING_MODE,
+  PROP_CAC,
 };
 
 static GstStaticPadTemplate gst_c2_venc_sink_pad_template =
@@ -270,6 +280,48 @@ gst_c2_hdr_mode_get_type (void)
   return gtype;
 }
 
+static GType
+gst_c2_encoding_mode_get_type (void)
+{
+  static GType gtype = 0;
+
+  static const GEnumValue variants[] = {
+    { GST_C2_ENCODING_MODE_DEFAULT, "Default", "default" },
+    { GST_C2_ENCODING_MODE_PROSIGHT, "The max quality for professional editing "
+        "used for HEVC 10-bit only", "prosight" },
+    { GST_C2_ENCODING_MODE_DEPTH, "Encode depth with less lossy compression, "
+        "given the nature of depth video", "depth" },
+    { GST_C2_ENCODING_MODE_LOOKAHEAD, "Improve video encoding quality by using "
+        "future frames information, limited in VBR_CFR only", "lookahead" },
+    { 0, NULL, NULL },
+  };
+
+  if (!gtype)
+    gtype = g_enum_register_static ("GstC2EncodingMode", variants);
+
+  return gtype;
+}
+
+static GType
+gst_c2_cac_get_type (void)
+{
+  static GType gtype = 0;
+
+  static const GEnumValue variants[] = {
+    { GST_C2_CAC_DEFAULT, "Default mode of the internal component", "default" },
+    { GST_C2_CAC_DISABLE_ALL, "Disable all CAC mode", "disable" },
+    { GST_C2_CAC_ENABLE_8BIT, "Enable 8-bit CAC mode", "8bit" },
+    { GST_C2_CAC_ENABLE_10BIT, "Enable 10-bit CAC mode", "10bit" },
+    { GST_C2_CAC_ENABLE_ALL, "Enable all CAC modes", "all" },
+    { 0, NULL, NULL },
+  };
+
+  if (!gtype)
+    gtype = g_enum_register_static ("GstC2Cac", variants);
+
+  return gtype;
+}
+
 static gboolean
 gst_caps_has_subformat (const GstCaps * caps, const gchar * subformat)
 {
@@ -355,6 +407,43 @@ gst_c2_venc_ltr_use (GstC2VEncoder * c2venc, guint id)
     GST_ERROR_OBJECT (c2venc, "Failed to set ltr use index!");
     return FALSE;
   }
+
+  return TRUE;
+}
+
+static gboolean
+gst_c2_venc_check_roi_mb_map_info (GstC2VEncoder * c2venc,
+    GstVideoInfo * vinfo)
+{
+  guint32 mb_size = 0, num_mb_rows = 0, num_mb_cols = 0, expected_mbs = 0;
+  GstC2QuantMbmapInfo *mb_map_info = &c2venc->mb_map_info;
+  GstVideoInfo *videoinfo = (vinfo == NULL) ? (&c2venc->instate->info) : vinfo;
+
+  // Determine macroblock size based on codec format
+  if (g_str_has_suffix (c2venc->name, "avc.encoder")) {
+    // AVC uses 16x16 macroblocks
+    mb_size = 16;
+  } else if (g_str_has_suffix (c2venc->name, "hevc.encoder")) {
+    // HEVC uses 32x32 macroblocks
+    mb_size = 32;
+  } else {
+    GST_ERROR_OBJECT (c2venc, "MB ROI is not supported for this codec");
+    return FALSE;
+  }
+
+  num_mb_cols = (GST_VIDEO_INFO_WIDTH (videoinfo) + mb_size - 1) / mb_size;
+  num_mb_rows = (GST_VIDEO_INFO_HEIGHT (videoinfo) + mb_size - 1) / mb_size;
+  expected_mbs = num_mb_cols * num_mb_rows;
+
+  if (mb_map_info->qp_bias_map->len != expected_mbs) {
+    GST_ERROR_OBJECT (c2venc, "Unexpected input ROI mb map length, "
+        "real len=%u, expected len=%u", mb_map_info->qp_bias_map->len,
+        expected_mbs);
+    return FALSE;
+  }
+
+  mb_map_info->mb_side_length = mb_size;
+  mb_map_info->total_mbs = expected_mbs;
 
   return TRUE;
 }
@@ -523,7 +612,7 @@ gst_c2_venc_setup_parameters (GstC2VEncoder * c2venc,
       return FALSE;
     }
 
-#if (CODEC2_CONFIG_VERSION_MAJOR == 2)
+#if (CODEC2_CONFIG_VERSION_MAJOR == 2 && CODEC2_CONFIG_VERSION_MINOR >= 1)
     if (c2venc->intra_refresh.mode != GST_C2_INTRA_REFRESH_DISABLED) {
       success = gst_c2_engine_set_parameter (c2venc->engine,
           GST_C2_PARAM_INTRA_REFRESH_MODE,
@@ -672,6 +761,14 @@ gst_c2_venc_setup_parameters (GstC2VEncoder * c2venc,
 
        if (!success) {
          GST_ERROR_OBJECT (c2venc, "Failed to enable heir bpreconditions!");
+         return FALSE;
+       }
+
+       success = gst_c2_engine_set_parameter (c2venc->engine,
+           GST_C2_PARAM_NATIVE_RECORDING, GST_PTR_CAST (&enable));
+       if (!success) {
+         GST_ERROR_OBJECT (c2venc, "Failed to enable heir bpreconditions"
+             " or native recording!");
          return FALSE;
        }
     } else if (c2venc->temp_layer.n_layers == 0 &&
@@ -838,6 +935,16 @@ gst_c2_venc_setup_parameters (GstC2VEncoder * c2venc,
     }
   }
 
+  if (c2venc->bitrate_boost_margin != DEFAULT_PROP_BITRATE_BOOST_MARGIN) {
+    success = gst_c2_engine_set_parameter (c2venc->engine,
+        GST_C2_PARAM_BITRATE_BOOST_MARGIN,
+        GST_PTR_CAST (&c2venc->bitrate_boost_margin));
+    if (!success) {
+      GST_ERROR_OBJECT (c2venc, "Failed to set bitrate boost margin!");
+      return FALSE;
+    }
+  }
+
   if (c2venc->hdr_mode != GST_C2_HDR_NONE) {
     success = gst_c2_engine_set_parameter (c2venc->engine,
         GST_C2_PARAM_HDR_MODE, GST_PTR_CAST (&(c2venc->hdr_mode)));
@@ -847,20 +954,98 @@ gst_c2_venc_setup_parameters (GstC2VEncoder * c2venc,
     }
   }
 
+  if (c2venc->mb_map_info.total_mbs != DEFAULT_PROP_MB_MAP_TOTAL_MBS) {
+    GstC2QuantMbmapInfo roi_mb_map;
+
+    if (c2venc->mb_map_info.qp_bias_map->len > 0 &&
+        gst_c2_venc_check_roi_mb_map_info (c2venc, info))
+      roi_mb_map.enable = TRUE;
+    else if (c2venc->mb_map_info.qp_bias_map->len == 0)
+      roi_mb_map.enable = FALSE;
+    else
+      return FALSE;
+
+    // To indicate setting mb map info in config state
+    roi_mb_map.total_mbs = 0;
+
+    success = gst_c2_engine_set_parameter (c2venc->engine,
+        GST_C2_PARAM_ROI_MBMAP_INFO, GST_PTR_CAST (&roi_mb_map));
+    if (!success) {
+      GST_ERROR_OBJECT (c2venc, "Failed to set roi mb map parameter!");
+      return FALSE;
+    }
+  }
+
+  if (c2venc->encoding_mode != DEFAULT_PROP_ENCODING_MODE) {
+    success = gst_c2_engine_set_parameter (c2venc->engine,
+        GST_C2_PARAM_ENCODING_MODE, GST_PTR_CAST (&c2venc->encoding_mode));
+    if (!success) {
+      GST_ERROR_OBJECT (c2venc, "Failed to set video encoding mode!");
+      return FALSE;
+    }
+  }
+
+  if (c2venc->cac != DEFAULT_PROP_CAC) {
+    success = gst_c2_engine_set_parameter (c2venc->engine,
+        GST_C2_PARAM_CAC, GST_PTR_CAST (&c2venc->cac));
+    if (!success) {
+      GST_ERROR_OBJECT (c2venc, "Failed to set content adaptive coding!");
+      return FALSE;
+    }
+  }
+
   return TRUE;
 }
 
 static void
+gst_c2_venc_free_roi_mb_map (GstC2QuantMbmapInfo * roi_mb_map)
+{
+  if (roi_mb_map == NULL)
+    return;
+
+  if (roi_mb_map->qp_bias_map != NULL)
+    g_array_free (roi_mb_map->qp_bias_map, TRUE);
+
+  g_free (roi_mb_map);
+}
+
+static void
 gst_c2_venc_handle_region_encode (GstC2VEncoder * c2venc,
-    GstVideoCodecFrame * frame)
+    GstVideoCodecFrame * frame, GstC2UserdataType * userdatatype)
 {
   GstMeta *meta = NULL;
   gpointer state = NULL;
   GstC2QuantRegions *roiparam = NULL;
+  GstC2QuantMbmapInfo *roi_mb_map = NULL;
   gint32 qpdelta = 0;
   guint32 idx = 0;
 
-  // ROI mode is disabled, nothing to do except to return immediately.
+  // Avoid race condition against setting mb map info property called by user
+  GST_OBJECT_LOCK (c2venc);
+  // Process MB-level first, mutually exclusive with legacy rectangle ROI
+  if (c2venc->mb_map_info.qp_bias_map->len > 0 &&
+      gst_c2_venc_check_roi_mb_map_info (c2venc, NULL)) {
+    // Allocate ROI mb map structure
+    roi_mb_map = g_new0 (GstC2QuantMbmapInfo, 1);
+    roi_mb_map->enable = TRUE;
+    roi_mb_map->mb_side_length = c2venc->mb_map_info.mb_side_length;
+    roi_mb_map->total_mbs = c2venc->mb_map_info.total_mbs;
+    roi_mb_map->qp_bias_map = g_array_copy (c2venc->mb_map_info.qp_bias_map);
+
+    // Attach ROI MB data to frame
+    gst_video_codec_frame_set_user_data (frame, roi_mb_map,
+        (GDestroyNotify) gst_c2_venc_free_roi_mb_map);
+    *userdatatype = GST_C2_USERDATA_TYPE_ROI_MB_MAP;
+
+    GST_LOG_OBJECT (c2venc, "Attached ROI MB data for frame %u",
+        frame->system_frame_number);
+  }
+  GST_OBJECT_UNLOCK (c2venc);
+
+  if (*userdatatype == GST_C2_USERDATA_TYPE_ROI_MB_MAP)
+    return;
+
+  // ROI quant mode is disabled, nothing to do except to return immediately
   if (!c2venc->roi_quant_mode)
     return;
 
@@ -939,6 +1124,7 @@ gst_c2_venc_handle_region_encode (GstC2VEncoder * c2venc,
 
   // Attach ROI info to the codec frame to be consumed by the component.
   gst_video_codec_frame_set_user_data (frame, roiparam, g_free);
+  *userdatatype = GST_C2_USERDATA_TYPE_ROI_RECTANGLE;
 
   return;
 }
@@ -1248,6 +1434,7 @@ gst_c2_venc_set_format (GstVideoEncoder * encoder, GstVideoCodecState * state)
   const gchar *name = NULL, *string = NULL;
   GstC2Profile profile = GST_C2_PROFILE_INVALID;
   GstC2Level level = GST_C2_LEVEL_INVALID;
+  GstC2PoolType pool_type = GST_C2_POOL_TYPE_UNSPECIFIED;
   guint32 param = 0;
   gint32 outwidth = 0, outheight = 0;
   gboolean success = FALSE;
@@ -1319,6 +1506,7 @@ gst_c2_venc_set_format (GstVideoEncoder * encoder, GstVideoCodecState * state)
   } else if (gst_structure_has_name (structure, "image/heic")) {
     name = "c2.qti.heic.encoder";
     c2venc->stream_format = GST_C2_HEIC_NONE;
+    pool_type = GST_C2_POOL_TYPE_DEFAULT_LINEAR;
   }
 
   if (name == NULL) {
@@ -1337,7 +1525,7 @@ gst_c2_venc_set_format (GstVideoEncoder * encoder, GstVideoCodecState * state)
 
   if (c2venc->engine == NULL) {
     c2venc->engine = gst_c2_engine_new (c2venc->name, GST_C2_MODE_VIDEO_ENCODE,
-        &callbacks, c2venc);
+        &callbacks, pool_type, c2venc);
     g_return_val_if_fail (c2venc->engine != NULL, FALSE);
   }
 
@@ -1347,6 +1535,8 @@ gst_c2_venc_set_format (GstVideoEncoder * encoder, GstVideoCodecState * state)
       profile = gst_c2_utils_h264_profile_from_string (string);
     else if (gst_structure_has_name (structure, "video/x-h265"))
       profile = gst_c2_utils_h265_profile_from_string (string);
+    else if (gst_structure_has_name (structure, "image/heic"))
+      profile = gst_c2_utils_heic_profile_from_string (string);
 
     if (profile == GST_C2_PROFILE_INVALID) {
       GST_ERROR_OBJECT (c2venc, "Unsupported profile '%s'!", string);
@@ -1422,6 +1612,11 @@ gst_c2_venc_set_format (GstVideoEncoder * encoder, GstVideoCodecState * state)
 
     if (level >= GST_C2_LEVEL_HEVC_HIGH_4 && level <= GST_C2_LEVEL_HEVC_HIGH_6_2)
       gst_structure_set (structure, "tier", G_TYPE_STRING, "high", NULL);
+  } else if (gst_structure_has_name (structure, "image/heic")) {
+    if (profile != GST_C2_PROFILE_INVALID) {
+      string = gst_c2_utils_heic_profile_to_string (profile);
+      gst_structure_set (structure, "profile", G_TYPE_STRING, string, NULL);
+    }
   }
   c2venc->profile = profile;
 
@@ -1535,6 +1730,7 @@ gst_c2_venc_handle_frame (GstVideoEncoder * encoder, GstVideoCodecFrame * frame)
   GstClockTimeDiff deadline;
   GstC2QueueItem item;
   gint fd = -1;
+  GstC2UserdataType userdatatype = GST_C2_USERDATA_TYPE_NONE;
 
   // GAP input buffer, drop the frame.
   if ((gst_buffer_get_size (frame->input_buffer) == 0) &&
@@ -1572,7 +1768,7 @@ gst_c2_venc_handle_frame (GstVideoEncoder * encoder, GstVideoCodecFrame * frame)
     gst_c2_venc_trigger_iframe (c2venc);
   }
 
-  gst_c2_venc_handle_region_encode (c2venc, frame);
+  gst_c2_venc_handle_region_encode (c2venc, frame, &userdatatype);
 
   if (c2venc->isheif)
     GST_BUFFER_FLAG_SET (frame->input_buffer, GST_VIDEO_BUFFER_FLAG_HEIC);
@@ -1638,6 +1834,7 @@ gst_c2_venc_handle_frame (GstVideoEncoder * encoder, GstVideoCodecFrame * frame)
   item.index = frame->system_frame_number;
   item.userdata = gst_video_codec_frame_get_user_data (frame);
   item.n_subframes = c2venc->n_subframes;
+  item.userdatatype = userdatatype;
 
   if (!gst_c2_engine_queue (c2venc->engine, &item)) {
     GST_ERROR_OBJECT(c2venc, "Failed to send input frame to be emptied!");
@@ -1740,40 +1937,40 @@ gst_c2_venc_set_property (GObject * object, guint prop_id,
       c2venc->bframes = g_value_get_uint (value);
       break;
     case PROP_QUANT_I_FRAMES:
-      c2venc->quant_init.i_frames = g_value_get_uint (value);
+      c2venc->quant_init.i_frames = g_value_get_int (value);
       c2venc->quant_init.i_frames_enable =
           (c2venc->quant_init.i_frames != DEFAULT_PROP_QUANT_I_FRAMES) ?
               TRUE : FALSE;
       break;
     case PROP_QUANT_P_FRAMES:
-      c2venc->quant_init.p_frames = g_value_get_uint (value);
+      c2venc->quant_init.p_frames = g_value_get_int (value);
       c2venc->quant_init.p_frames_enable =
           (c2venc->quant_init.i_frames != DEFAULT_PROP_QUANT_P_FRAMES) ?
               TRUE : FALSE;
       break;
     case PROP_QUANT_B_FRAMES:
-      c2venc->quant_init.b_frames = g_value_get_uint (value);
+      c2venc->quant_init.b_frames = g_value_get_int (value);
       c2venc->quant_init.b_frames_enable =
           (c2venc->quant_init.i_frames != DEFAULT_PROP_QUANT_B_FRAMES) ?
               TRUE : FALSE;
       break;
     case PROP_MIN_QP_I_FRAMES:
-      c2venc->quant_ranges.min_i_qp = g_value_get_uint (value);
+      c2venc->quant_ranges.min_i_qp = g_value_get_int (value);
       break;
     case PROP_MAX_QP_I_FRAMES:
-      c2venc->quant_ranges.max_i_qp = g_value_get_uint (value);
+      c2venc->quant_ranges.max_i_qp = g_value_get_int (value);
       break;
     case PROP_MIN_QP_B_FRAMES:
-      c2venc->quant_ranges.min_b_qp = g_value_get_uint (value);
+      c2venc->quant_ranges.min_b_qp = g_value_get_int (value);
       break;
     case PROP_MAX_QP_B_FRAMES:
-      c2venc->quant_ranges.max_b_qp = g_value_get_uint (value);
+      c2venc->quant_ranges.max_b_qp = g_value_get_int (value);
       break;
     case PROP_MIN_QP_P_FRAMES:
-      c2venc->quant_ranges.min_p_qp = g_value_get_uint (value);
+      c2venc->quant_ranges.min_p_qp = g_value_get_int (value);
       break;
     case PROP_MAX_QP_P_FRAMES:
-      c2venc->quant_ranges.max_p_qp = g_value_get_uint (value);
+      c2venc->quant_ranges.max_p_qp = g_value_get_int (value);
       break;
     case PROP_ROI_QUANT_MODE:
       c2venc->roi_quant_mode = g_value_get_boolean (value);
@@ -1820,6 +2017,17 @@ gst_c2_venc_set_property (GObject * object, guint prop_id,
       }
       break;
     }
+    case PROP_ROI_MB_MAP_INFO:
+      // Remove all old values.
+      g_array_set_size (c2venc->mb_map_info.qp_bias_map, 0);
+      c2venc->mb_map_info.total_mbs = 0;
+
+      for (guint idx = 0; idx < gst_value_array_get_size (value); idx++) {
+        gint8 qp_bias =
+            g_value_get_schar (gst_value_array_get_value (value, idx));
+        g_array_append_val (c2venc->mb_map_info.qp_bias_map, qp_bias);
+      }
+      break;
     case PROP_CHROMA_QP_OFFSET:
     {
       c2venc->chroma_qp_offset = g_value_get_int (value);
@@ -1902,6 +2110,15 @@ gst_c2_venc_set_property (GObject * object, guint prop_id,
     case PROP_HDR_MODE:
       c2venc->hdr_mode = g_value_get_enum (value);
       break;
+    case PROP_BITRATE_BOOST_MARGIN:
+      c2venc->bitrate_boost_margin = g_value_get_int (value);
+      break;
+    case PROP_ENCODING_MODE:
+      c2venc->encoding_mode = g_value_get_enum (value);
+      break;
+    case PROP_CAC:
+      c2venc->cac = g_value_get_enum (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -1941,31 +2158,31 @@ gst_c2_venc_get_property (GObject * object, guint prop_id,
       g_value_set_uint (value, c2venc->bframes);
       break;
     case PROP_QUANT_I_FRAMES:
-      g_value_set_uint (value, c2venc->quant_init.i_frames);
+      g_value_set_int (value, c2venc->quant_init.i_frames);
       break;
     case PROP_QUANT_P_FRAMES:
-      g_value_set_uint (value, c2venc->quant_init.p_frames);
+      g_value_set_int (value, c2venc->quant_init.p_frames);
       break;
     case PROP_QUANT_B_FRAMES:
-      g_value_set_uint (value, c2venc->quant_init.b_frames);
+      g_value_set_int (value, c2venc->quant_init.b_frames);
       break;
     case PROP_MIN_QP_I_FRAMES:
-      g_value_set_uint (value, c2venc->quant_ranges.min_i_qp);
+      g_value_set_int (value, c2venc->quant_ranges.min_i_qp);
       break;
     case PROP_MAX_QP_I_FRAMES:
-      g_value_set_uint (value, c2venc->quant_ranges.max_i_qp);
+      g_value_set_int (value, c2venc->quant_ranges.max_i_qp);
       break;
     case PROP_MIN_QP_P_FRAMES:
-      g_value_set_uint (value, c2venc->quant_ranges.min_p_qp);
+      g_value_set_int (value, c2venc->quant_ranges.min_p_qp);
       break;
     case PROP_MAX_QP_P_FRAMES:
-      g_value_set_uint (value, c2venc->quant_ranges.max_p_qp);
+      g_value_set_int (value, c2venc->quant_ranges.max_p_qp);
       break;
     case PROP_MIN_QP_B_FRAMES:
-      g_value_set_uint (value, c2venc->quant_ranges.min_b_qp);
+      g_value_set_int (value, c2venc->quant_ranges.min_b_qp);
       break;
     case PROP_MAX_QP_B_FRAMES:
-      g_value_set_uint (value, c2venc->quant_ranges.max_b_qp);
+      g_value_set_int (value, c2venc->quant_ranges.max_b_qp);
       break;
     case PROP_ROI_QUANT_MODE:
       g_value_set_boolean (value, c2venc->roi_quant_mode);
@@ -2011,6 +2228,17 @@ gst_c2_venc_get_property (GObject * object, guint prop_id,
       }
       break;
     }
+    case PROP_ROI_MB_MAP_INFO:
+      for (guint idx = 0; idx < c2venc->mb_map_info.qp_bias_map->len; idx++) {
+        GValue element = G_VALUE_INIT;
+        g_value_init (&element, G_TYPE_CHAR);
+        g_value_set_schar (&element,
+            g_array_index (c2venc->mb_map_info.qp_bias_map, gint8, idx));
+
+        // Append the MB map QP value to the output GST array.
+        gst_value_array_append_value (value, &element);
+        g_value_unset (&element);
+      }
     case PROP_CHROMA_QP_OFFSET:
       g_value_set_int (value, c2venc->chroma_qp_offset);
       break;
@@ -2067,6 +2295,15 @@ gst_c2_venc_get_property (GObject * object, guint prop_id,
     case PROP_HDR_MODE:
       g_value_set_enum (value, c2venc->hdr_mode);
       break;
+    case PROP_BITRATE_BOOST_MARGIN:
+      g_value_set_int (value, c2venc->bitrate_boost_margin);
+      break;
+    case PROP_ENCODING_MODE:
+      g_value_set_enum (value, c2venc->encoding_mode);
+      break;
+    case PROP_CAC:
+      g_value_set_enum (value, c2venc->cac);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -2082,6 +2319,7 @@ gst_c2_venc_finalize (GObject * object)
 
   g_array_free (c2venc->roi_quant_boxes, TRUE);
   gst_structure_free (c2venc->roi_quant_values);
+  g_array_free (c2venc->mb_map_info.qp_bias_map, TRUE);
 
   g_array_free (c2venc->temp_layer.bitrate_ratios, TRUE);
 
@@ -2156,49 +2394,52 @@ gst_c2_venc_class_init (GstC2VEncoderClass * klass)
           0, G_MAXUINT, DEFAULT_PROP_B_FRAMES,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject, PROP_QUANT_I_FRAMES,
-      g_param_spec_uint ("quant-i-frames", "I-Frame Quantization",
+      g_param_spec_int ("quant-i-frames", "I-Frame Quantization",
           "Quantization parameter for I-frames (0xffffffff=component default)",
-          0, G_MAXUINT, DEFAULT_PROP_QUANT_I_FRAMES,
+          G_MININT32, G_MAXINT32, DEFAULT_PROP_QUANT_I_FRAMES,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject, PROP_QUANT_P_FRAMES,
-      g_param_spec_uint ("quant-p-frames", "P-Frame Quantization",
+      g_param_spec_int ("quant-p-frames", "P-Frame Quantization",
           "Quantization parameter for P-frames (0xffffffff=component default)",
-          0, G_MAXUINT, DEFAULT_PROP_QUANT_P_FRAMES,
+          G_MININT32, G_MAXINT32, DEFAULT_PROP_QUANT_P_FRAMES,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject, PROP_QUANT_B_FRAMES,
-      g_param_spec_uint ("quant-b-frames", "B-Frame Quantization",
+      g_param_spec_int ("quant-b-frames", "B-Frame Quantization",
           "Quantization parameter for B-frames (0xffffffff=component default)",
-          0, G_MAXUINT, DEFAULT_PROP_QUANT_B_FRAMES,
+          G_MININT32, G_MAXINT32, DEFAULT_PROP_QUANT_B_FRAMES,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject, PROP_MIN_QP_I_FRAMES,
-      g_param_spec_uint ("min-quant-i-frames", "Min quant I frames",
-          "Minimum quantization parameter allowed for I-frames",
-          0, G_MAXUINT, DEFAULT_PROP_MIN_QP_I_FRAMES,
+      g_param_spec_int ("min-quant-i-frames", "Min quant I frames",
+          "Minimum quantization parameter allowed for I-frames, "
+          "8bit starts from 0 and 10bit starts from -12",
+          G_MININT32, G_MAXINT32, DEFAULT_PROP_MIN_QP_I_FRAMES,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject, PROP_MAX_QP_I_FRAMES,
-      g_param_spec_uint ("max-quant-i-frames", "Max quant I frames",
+      g_param_spec_int ("max-quant-i-frames", "Max quant I frames",
           "Maximum quantization parameter allowed for I-frames",
-          0, G_MAXUINT, DEFAULT_PROP_MAX_QP_I_FRAMES,
+          G_MININT32, G_MAXINT32, DEFAULT_PROP_MAX_QP_I_FRAMES,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject, PROP_MIN_QP_P_FRAMES,
-      g_param_spec_uint ("min-quant-p-frames", "Min quant P frames",
-          "Minimum quantization parameter allowed for P-frames",
-          0, G_MAXUINT, DEFAULT_PROP_MIN_QP_P_FRAMES,
+      g_param_spec_int ("min-quant-p-frames", "Min quant P frames",
+          "Minimum quantization parameter allowed for P-frames, "
+          "8bit starts from 0 and 10bit starts from -12",
+          G_MININT32, G_MAXINT32, DEFAULT_PROP_MIN_QP_P_FRAMES,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject, PROP_MAX_QP_P_FRAMES,
-      g_param_spec_uint ("max-quant-p-frames", "Max quant P frames",
+      g_param_spec_int ("max-quant-p-frames", "Max quant P frames",
           "Maximum quantization parameter allowed for P-frames",
-          0, G_MAXUINT, DEFAULT_PROP_MAX_QP_P_FRAMES,
+          G_MININT32, G_MAXINT32, DEFAULT_PROP_MAX_QP_P_FRAMES,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject, PROP_MIN_QP_B_FRAMES,
-      g_param_spec_uint ("min-quant-b-frames", "Min quant B frames",
-          "Minimum quantization parameter allowed for B-frames",
-          0, G_MAXUINT, DEFAULT_PROP_MIN_QP_B_FRAMES,
+      g_param_spec_int ("min-quant-b-frames", "Min quant B frames",
+          "Minimum quantization parameter allowed for B-frames, "
+          "8bit starts from 0 and 10bit starts from -12",
+          G_MININT32, G_MAXINT32, DEFAULT_PROP_MIN_QP_B_FRAMES,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject, PROP_MAX_QP_B_FRAMES,
-      g_param_spec_uint ("max-quant-b-frames", "Max quant B frames",
+      g_param_spec_int ("max-quant-b-frames", "Max quant B frames",
           "Maximum quantization parameter allowed for B-frames",
-          0, G_MAXUINT, DEFAULT_PROP_MAX_QP_B_FRAMES,
+          G_MININT32, G_MAXINT32, DEFAULT_PROP_MAX_QP_B_FRAMES,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject, PROP_ROI_QUANT_MODE,
       g_param_spec_boolean ("roi-quant-mode", "ROI Quantization Mode",
@@ -2225,6 +2466,15 @@ gst_c2_venc_class_init (GstC2VEncoderClass * klass)
                   G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS),
               G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS),
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
+  g_object_class_install_property (gobject, PROP_ROI_MB_MAP_INFO,
+      gst_param_spec_array ("roi-mb-map-info", "ROI MB Map Info",
+          "Manually set Macroblock-level based ROI QP map info in Garray per "
+          "frame. DeltaQP range: [-31, 30], MB size: 16 for AVC / 32 for HEVC",
+          g_param_spec_char ("value", "QP Value",
+                  "The QP value for each Macroblock within the frame",
+                  G_MININT8, G_MAXINT8, 0,
+                  G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS),
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject, PROP_CHROMA_QP_OFFSET,
       g_param_spec_int ("chroma-qp-offset", "Chroma Quantization Offset",
           "Chroma Quantization offset from Luma Quantization, supported "
@@ -2296,6 +2546,26 @@ gst_c2_venc_class_init (GstC2VEncoderClass * klass)
           "encoder. It determines whether SEI nal will be parsed in codec2."
           "(0x7fffffff=component default)",
           GST_TYPE_C2_HDR_MODE, DEFAULT_PROP_HDR_MODE,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
+  g_object_class_install_property (gobject, PROP_BITRATE_BOOST_MARGIN,
+      g_param_spec_int ("bitrate-boost-margin", "Bitrate Boost Margin",
+          "Used to set bitrate boost margin percentage, "
+          "Its for CAC feature, for apps like VCHAT which needs higher bitrate "
+          "for low resolution clip, bitrate can be boosted with this setting. "
+          "(0x7fffffff=component default, value range could be 0 to 100)",
+          0, G_MAXINT, DEFAULT_PROP_BITRATE_BOOST_MARGIN,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
+  g_object_class_install_property (gobject, PROP_ENCODING_MODE,
+      g_param_spec_enum ("encoding-mode", "Video Encoding Modes",
+          "Used by applications for setting the encoding usecase, the encoder "
+          "will override certain parameters internally necessary to meet the "
+          "functionality/quality/performance for the requested mode.",
+          GST_TYPE_C2_ENCODING_MODE, DEFAULT_PROP_ENCODING_MODE,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
+  g_object_class_install_property (gobject, PROP_CAC,
+      g_param_spec_enum ("cac", "Content Adaptive Coding",
+          "The mode for content adaptive coding (CAC) to achieve better quality "
+          "at a lower bit rate (VBR limited).", GST_TYPE_C2_CAC, DEFAULT_PROP_CAC,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
 
   g_signal_new_class_handler ("trigger-iframe", G_TYPE_FROM_CLASS (klass),
@@ -2387,6 +2657,11 @@ gst_c2_venc_init (GstC2VEncoder * c2venc)
   c2venc->roi_quant_boxes =
       g_array_new (FALSE, FALSE, sizeof (GstC2QuantRectangle));
 
+  c2venc->mb_map_info.enable = FALSE;
+  c2venc->mb_map_info.mb_side_length = 0;
+  c2venc->mb_map_info.total_mbs = DEFAULT_PROP_MB_MAP_TOTAL_MBS;
+  c2venc->mb_map_info.qp_bias_map = g_array_new (FALSE, FALSE, sizeof (gint8));
+
   c2venc->entropy_mode = DEFAULT_PROP_ENTROPY_MODE;
   c2venc->loop_filter_mode = DEFAULT_PROP_LOOP_FILTER_MODE;
   c2venc->num_ltr_frames = DEFAULT_PROP_NUM_LTR_FRAMES;
@@ -2397,7 +2672,10 @@ gst_c2_venc_init (GstC2VEncoder * c2venc)
       g_array_new (FALSE, FALSE, sizeof (gfloat));
   c2venc->n_subframes = 0;
   c2venc->vbv_delay = DEFAULT_PROP_VBV_DELAY;
+  c2venc->bitrate_boost_margin = DEFAULT_PROP_BITRATE_BOOST_MARGIN;
   c2venc->hdr_mode = DEFAULT_PROP_HDR_MODE;
+  c2venc->encoding_mode = DEFAULT_PROP_ENCODING_MODE;
+  c2venc->cac = DEFAULT_PROP_CAC;
 
   GST_DEBUG_CATEGORY_INIT (c2_venc_debug, "qtic2venc", 0,
       "QTI c2venc encoder");
