@@ -185,7 +185,7 @@ gst_video_composition_cleanup (gpointer userdata)
   GstVideoComposition *composition = (GstVideoComposition*) userdata;
 
   // Free only video blits, output frame is owned by the request.
-  g_slice_free (GstVideoBlit, composition->blits);
+  g_clear_pointer (&(composition->blits), gst_video_blits_unref);
 }
 
 static inline void
@@ -235,16 +235,19 @@ static inline void
 gst_video_split_composition_populate_metas (GstVideoSplitSrcPad * srcpad,
     GstVideoComposition * composition, GstVideoRegionOfInterestMeta * roimeta)
 {
+  GstVideoBlit *vblit = NULL;
   GstBuffer *inbuffer = NULL, *outbuffer = NULL;
   GstVideoRectangle source = {0}, *destination = NULL;
   GstMeta *meta = NULL;
   gpointer state = NULL;
 
-  inbuffer = composition->blits[0].buffer;
+  vblit = gst_video_blits_entry (composition->blits, 0);
+
+  inbuffer = vblit->buffer;
   outbuffer = composition->buffer;
 
-  gst_video_quadrilateral_to_rectangle (&(composition->blits[0].source), &source);
-  destination = &(composition->blits[0].destination);
+  gst_video_quadrilateral_to_rectangle (&(vblit->source), &source);
+  destination = &(vblit->destination);
 
   while ((meta = gst_buffer_iterate_meta (inbuffer, &state))) {
     if (meta->info->api == GST_VIDEO_REGION_OF_INTEREST_META_API_TYPE) {
@@ -307,7 +310,7 @@ gst_video_split_composition_update_regions (GstVideoSplitSrcPad * srcpad,
   gint maxwidth = 0, maxheight = 0;
 
   outbuffer = composition->buffer;
-  vblit = &(composition->blits[0]);
+  vblit = gst_video_blits_entry (composition->blits, 0);
 
   if (roimeta != NULL) {
     source.x = roimeta->x;
@@ -321,10 +324,10 @@ gst_video_split_composition_update_regions (GstVideoSplitSrcPad * srcpad,
   }
 
   gst_video_quadrilateral_from_rectangle (&(vblit->source), &source);
-  vblit->mask |= GST_VCE_MASK_SOURCE;
+  vblit->mask |= GST_VIDEO_CONVERTER_MASK_SOURCE;
 
   destination = &(vblit->destination);
-  vblit->mask |= GST_VCE_MASK_DESTINATION;
+  vblit->mask |= GST_VIDEO_CONVERTER_MASK_DESTINATION;
 
   destination->x = destination->y = 0;
   destination->w = maxwidth =  GST_VIDEO_INFO_WIDTH (composition->info);
@@ -677,27 +680,25 @@ gst_video_split_populate_frames_and_compositions (GstVideoSplit * vsplit,
 
       composition->buffer = outbuffer;
       composition->info = outinfo;
-      composition->datatype = GST_VCE_DATA_TYPE_U8;
+      composition->datatype = GST_VIDEO_DATA_TYPE_U8;
 
       composition->bgcolor = 0x00000000;
       composition->bgfill = TRUE;
 
-      for (i = 0; i < GST_VCE_MAX_CHANNELS; ++i) {
+      for (i = 0; i < GST_VIDEO_MAX_COMPONENTS; ++i) {
         composition->scales[i] = 1.0;
         composition->offsets[i] = 0.0;
       }
 
-      composition->blits = g_slice_new0 (GstVideoBlit);
-      composition->n_blits = 1;
-
-      vblit = &(composition->blits[0]);
+      composition->blits = gst_video_blits_new_sized (1);
+      vblit = gst_video_blits_entry (composition->blits, 0);
 
       vblit->buffer = inbuffer;
       vblit->info = ininfo;
       vblit->mask = 0;
 
       vblit->alpha = G_MAXUINT8;
-      vblit->rotate = GST_VCE_ROTATE_0;
+      vblit->rotate = GST_VIDEO_ROTATE_0;
 
       // Depending on the mode a different ROI meta is used or none at all.
       if (srcpad->mode == GST_VSPLIT_MODE_ROI_SINGLE)
@@ -736,7 +737,10 @@ gst_video_split_sinkpad_chain (GstPad * pad, GstObject * parent,
   GstVideoSplit *vsplit = GST_VIDEO_SPLIT (parent);
   GstVSplitRequest *request = NULL;
   GArray *compositions = NULL;
+  GstClockTime time = GST_CLOCK_TIME_NONE;
   gboolean success = FALSE;
+
+  time = gst_util_get_timestamp ();
 
   GST_TRACE_OBJECT (pad, "Received %" GST_PTR_FORMAT, inbuffer);
 
@@ -770,9 +774,6 @@ gst_video_split_sinkpad_chain (GstPad * pad, GstObject * parent,
     goto cleanup;
   }
 
-  // Get start time for performance measurements.
-  request->time = gst_util_get_timestamp ();
-
   if (compositions->len != 0) {
     success = gst_video_converter_engine_compose (vsplit->converter,
         (GstVideoComposition*) compositions->data, compositions->len,
@@ -786,6 +787,12 @@ gst_video_split_sinkpad_chain (GstPad * pad, GstObject * parent,
 
   g_array_free (compositions, TRUE);
   gst_data_queue_push_object (sinkpad->requests, GST_MINI_OBJECT (request));
+
+  time = GST_CLOCK_DIFF (time, gst_util_get_timestamp ());
+
+  GST_LOG_OBJECT (vsplit, "Performance time %" G_GINT64_FORMAT ".%03"
+      G_GINT64_FORMAT " ms, HW utilization: %s", GST_TIME_AS_MSECONDS (time),
+      (GST_TIME_AS_USECONDS (time) % 1000), vsplit->hw_util);
 
   return GST_FLOW_OK;
 
@@ -1314,6 +1321,11 @@ gst_video_split_set_property (GObject * object, guint prop_id,
   switch (prop_id) {
     case PROP_ENGINE_BACKEND:
       vsplit->backend = g_value_get_enum (value);
+
+      if (vsplit->backend == GST_VIDEO_CONVERTER_BACKEND_GLES)
+        g_strlcpy (vsplit->hw_util, "GPU", sizeof(vsplit->hw_util));
+      else
+        g_strlcpy (vsplit->hw_util, "CPU", sizeof(vsplit->hw_util));
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -1370,7 +1382,7 @@ gst_video_split_class_init (GstVideoSplitClass * klass)
   g_object_class_install_property (gobject, PROP_ENGINE_BACKEND,
       g_param_spec_enum ("engine", "Engine",
           "Engine backend used for the conversion operations",
-          GST_TYPE_VCE_BACKEND, DEFAULT_PROP_ENGINE_BACKEND,
+          GST_TYPE_VIDEO_CONVERTER_BACKEND, DEFAULT_PROP_ENGINE_BACKEND,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_set_static_metadata (element,
@@ -1402,6 +1414,11 @@ gst_video_split_init (GstVideoSplit * vsplit)
   vsplit->worktask = NULL;
 
   vsplit->backend = DEFAULT_PROP_ENGINE_BACKEND;
+
+  if (vsplit->backend == GST_VIDEO_CONVERTER_BACKEND_GLES)
+    g_strlcpy (vsplit->hw_util, "GPU", sizeof(vsplit->hw_util));
+  else
+    g_strlcpy (vsplit->hw_util, "CPU", sizeof(vsplit->hw_util));
 
   template = gst_video_split_sink_template ();
   vsplit->sinkpad = g_object_new (GST_TYPE_VIDEO_SPLIT_SINKPAD, "name", "sink",

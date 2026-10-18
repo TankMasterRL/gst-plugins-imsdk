@@ -21,14 +21,6 @@
 #define LA_URL                 "https://test.playready.microsoft.com/service/" \
     "rightsmanager.asmx?cfg=(securestop:false,persist:false,sl:150)"
 
-// To be obtained and specified post Widevine license agreement.
-#define CDM_PROV_URL           ""
-#define CDM_LIC_URL            ""
-
-const std::string kProductName = "DRMPlayer";
-const std::string kCompanyName = "QTI";
-const std::string kModelName   = "QRB5165";
-
 // To store license request and response data
 struct soapbuf {
   gchar   *pdata;
@@ -332,7 +324,7 @@ WidevineContext::FetchProvisioningResponse (std::string request)
   req_buf_size = request.length();
   req_buf = g_strndup (request.c_str(), req_buf_size);
 
-  url = g_strconcat ((const gchar *) CDM_PROV_URL, req_buf, NULL);
+  url = g_strconcat (prov_url_.c_str(), req_buf, NULL);
 
   http_header = curl_slist_append (http_header, "Host: www.googleapis.com");
   http_header = curl_slist_append (http_header, "Connection: close");
@@ -355,14 +347,10 @@ WidevineContext::InitSession ()
 {
   std::string prov_request, prov_response;
   widevine::Cdm::Status status = widevine::Cdm::kTypeError;
-  widevine::Cdm::ClientInfo client_info;
-  client_info.product_name = kProductName;
-  client_info.company_name = kCompanyName;
-  client_info.model_name = kModelName;
 
   // Initialize the CDM Library.
   if ((status = widevine::Cdm::initialize (widevine::Cdm::kOpaqueHandle,
-      client_info, storage_impl, clock_impl, timer_impl, widevine::Cdm::kErrors))
+      storage_impl, clock_impl, timer_impl, logger_impl, widevine::Cdm::kErrors))
       != widevine::Cdm::kSuccess) {
     g_printerr ("ERROR: Couldn't initialize the CDM Library! \n");
     return status;
@@ -377,7 +365,7 @@ WidevineContext::InitSession ()
   g_print ("Created new CDM instance.\n");
 
   // Provision the device if not provisioned.
-  if (!cdm_->isProvisioned()) {
+  if (cdm_->getProvisioningStatus()) {
     g_print ("Device is not provisioned. Provisioning first...\n");
 
     if ((status = cdm_->getProvisioningRequest (&prov_request))
@@ -448,7 +436,7 @@ gint
 WidevineContext::FetchLicense ()
 {
   struct curl_slist *http_header = NULL;
-  gchar *url = (gchar *) CDM_LIC_URL;
+  gchar *url = (gchar *) lic_url_.c_str();
   gchar *req_buf = NULL;
   size_t req_buf_size;
 
@@ -485,6 +473,7 @@ WidevineContext::~WidevineContext ()
   delete storage_impl;
   delete clock_impl;
   delete timer_impl;
+  delete logger_impl;
 
   if (cdm_ == nullptr)
     return;

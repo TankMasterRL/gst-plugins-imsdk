@@ -1,0 +1,215 @@
+/*
+* Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions are
+* met:
+*     * Redistributions of source code must retain the above copyright
+*       notice, this list of conditions and the following disclaimer.
+*     * Redistributions in binary form must reproduce the above
+*       copyright notice, this list of conditions and the following
+*       disclaimer in the documentation and/or other materials provided
+*       with the distribution.
+*     * Neither the name of The Linux Foundation nor the names of its
+*       contributors may be used to endorse or promote products derived
+*       from this software without specific prior written permission.
+*
+* THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
+* WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT
+* ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS
+* BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+* CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+* SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
+* BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+* WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+* OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
+* IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*
+* Changes from Qualcomm Technologies, Inc. are provided under the following license:
+*
+* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+* SPDX-License-Identifier: BSD-3-Clause-Clear
+*/
+
+
+#ifndef __GST_CAMERASRC_CONTEXT_H__
+#define __GST_CAMERASRC_CONTEXT_H__
+
+#include <gst/gst.h>
+
+G_BEGIN_DECLS
+
+#define GST_QMMF_CONTEXT_CAST(obj)   ((GstQmmfContext*)(obj))
+
+typedef struct _GstQmmfContext            GstQmmfContext;
+typedef struct _GstQmmfLogicalCamInfo     GstQmmfLogicalCamInfo;
+typedef struct _GstQmmfCameraSwitchInfo   GstQmmfCameraSwitchInfo;
+
+typedef struct _CameraDeviceStatus {
+  guint32 camera_id;
+  guint8 is_present;
+} CameraDeviceStatus;
+
+typedef void (*GstCameraEventCb) (guint event, gpointer userdata);
+typedef void (*GstCameraMetaCb) (gint camera_id, gconstpointer metadata,
+    gboolean isurgent, gpointer userdata);
+
+enum {
+  EVENT_UNKNOWN,
+  EVENT_SERVICE_DIED,
+  EVENT_CAMERA_ERROR,
+  EVENT_CAMERA_OPENED,
+  EVENT_CAMERA_CLOSING,
+  EVENT_CAMERA_CLOSED,
+  EVENT_FRAME_ERROR,
+  EVENT_METADATA_ERROR,
+  EVENT_SOF_FREEZE,
+  EVENT_RECOVERYFAILURE,
+  EVENT_FATAL,
+  EVENT_RECOVERYSUCCESS,
+  EVENT_INTERNAL_RECOVERY,
+  EVENT_DEVICE_STATUS_CHANGE,
+};
+
+enum
+{
+  PARAM_CAMERA_ID,
+  PARAM_CAMERA_SLAVE,
+  PARAM_CAMERA_LDC,
+  PARAM_CAMERA_LCAC,
+  PARAM_CAMERA_EIS,
+  PARAM_CAMERA_SHDR,
+  PARAM_CAMERA_VHDR,
+  PARAM_CAMERA_ADRC,
+  PARAM_CAMERA_CONTROL_MODE,
+  PARAM_CAMERA_EFFECT_MODE,
+  PARAM_CAMERA_SCENE_MODE,
+  PARAM_CAMERA_ANTIBANDING_MODE,
+  PARAM_CAMERA_SHARPNESS,
+  PARAM_CAMERA_CONTRAST,
+  PARAM_CAMERA_SATURATION,
+  PARAM_CAMERA_ISO_MODE,
+  PARAM_CAMERA_ISO_VALUE,
+  PARAM_CAMERA_EXPOSURE_MODE,
+  PARAM_CAMERA_EXPOSURE_LOCK,
+  PARAM_CAMERA_EXPOSURE_METERING,
+  PARAM_CAMERA_EXPOSURE_COMPENSATION,
+  PARAM_CAMERA_EXPOSURE_TIME,
+  PARAM_CAMERA_EXPOSURE_TABLE,
+  PARAM_CAMERA_WHITE_BALANCE_MODE,
+  PARAM_CAMERA_WHITE_BALANCE_LOCK,
+  PARAM_CAMERA_MANUAL_WB_SETTINGS,
+  PARAM_CAMERA_FOCUS_MODE,
+  PARAM_CAMERA_NOISE_REDUCTION,
+  PARAM_CAMERA_NOISE_REDUCTION_TUNING,
+  PARAM_CAMERA_ZOOM,
+  PARAM_CAMERA_DEFOG_TABLE,
+  PARAM_CAMERA_LOCAL_TONE_MAPPING,
+  PARAM_CAMERA_IR_MODE,
+  PARAM_CAMERA_ACTIVE_SENSOR_SIZE,
+  PARAM_CAMERA_SENSOR_MODE,
+  PARAM_CAMERA_VIDEO_METADATA,
+  PARAM_CAMERA_IMAGE_METADATA,
+  PARAM_CAMERA_STATIC_METADATA,
+  PARAM_CAMERA_SESSION_METADATA,
+  PARAM_CAMERA_FRC_MODE,
+  PARAM_CAMERA_IFE_DIRECT_STREAM,
+  PARAM_CAMERA_MULTI_CAM_EXPOSURE_TIME,
+  PARAM_CAMERA_STANDBY,
+  PARAM_CAMERA_OPERATION_MODE,
+  PARAM_CAMERA_INPUT_ROI,
+  PARAM_CAMERA_INPUT_ROI_INFO,
+  PARAM_CAMERA_PHYISICAL_CAMERA_SWITCH,
+  PARAM_CAMERA_SUPER_FRAMERATE,
+  PARAM_CAMERA_MULTICAMERA_HINT,
+  PARAM_CAMERA_SW_TNR,
+  PARAM_CAMERA_STATIC_METADATAS,
+};
+
+GST_API GstQmmfContext *
+gst_qmmf_context_new (GstCameraEventCb eventcb, GstCameraMetaCb metacb,
+                      gpointer userdata);
+
+GST_API void
+gst_qmmf_context_free (GstQmmfContext * context);
+
+GST_API gboolean
+gst_qmmf_context_open (GstQmmfContext * context);
+
+GST_API gboolean
+gst_qmmf_context_close (GstQmmfContext * context);
+
+GST_API gboolean
+gst_qmmf_context_create_video_stream (GstQmmfContext * context, GstPad * pad);
+
+GST_API gboolean
+gst_qmmf_context_delete_video_stream (GstQmmfContext * context, GstPad * pad);
+
+GST_API gboolean
+gst_qmmf_context_create_image_stream (GstQmmfContext * context, GstPad * pad);
+
+GST_API gboolean
+gst_qmmf_context_delete_image_stream (GstQmmfContext * context, GstPad * pad,
+                                      gboolean cache);
+
+GST_API gboolean
+gst_qmmf_context_start_video_streams (GstQmmfContext * context, GArray * ids);
+
+GST_API gboolean
+gst_qmmf_context_stop_video_streams (GstQmmfContext * context, GArray * ids);
+
+GST_API gboolean
+gst_qmmf_context_capture_image (GstQmmfContext * context,
+                                GHashTable * srcpads,
+                                GList * imgindexes,
+                                guint imgtype,
+                                guint n_images,
+                                GPtrArray * metas);
+
+GST_API gboolean
+gst_qmmf_context_is_metadata_enabled (GstQmmfContext * context);
+
+GST_API void
+gst_qmmf_context_store_metadata (GstQmmfContext * context, gpointer metadata);
+
+GST_API void
+gst_qmmf_context_register_metadata_pad (GstQmmfContext * context, GstPad * pad);
+
+GST_API void
+gst_qmmf_context_unregister_metadata_pad (GstQmmfContext * context, GstPad * pad);
+
+GST_API gboolean gst_qmmf_context_dynamic_capture_image(
+    GstQmmfContext *context, GHashTable *srcpads, GList *imgindexes,
+    gchar *req_group_str, guint imgtype, guint n_burst, GPtrArray *metas);
+
+GST_API void
+gst_qmmf_context_set_camera_param (GstQmmfContext * context, guint param_id,
+                                   const GValue * value);
+
+GST_API void
+gst_qmmf_context_get_camera_param (GstQmmfContext * context, guint param_id,
+                                   GValue * value);
+
+GST_API void
+gst_qmmf_context_update_video_param (GstPad * pad, GParamSpec * pspec,
+                                     GstQmmfContext * context);
+
+GST_API guint32
+gst_qmmf_context_get_device_status_camera_id (GstQmmfContext * context);
+
+GST_API gboolean
+gst_qmmf_context_get_device_status_is_present (GstQmmfContext * context);
+
+GST_API void
+gst_qmmf_context_set_feature_caps (GstQmmfContext * context, gpointer caps);
+
+GST_API void
+gst_qmmf_context_get_static_meta (gpointer *caps);
+
+guint
+get_vendor_tag_by_name (const gchar * section, const gchar * name);
+
+G_END_DECLS
+
+#endif // __GST_CAMERASRC_CONTEXT_H__

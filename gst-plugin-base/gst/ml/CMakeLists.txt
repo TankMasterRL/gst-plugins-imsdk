@@ -13,13 +13,20 @@ add_library(${TARGET_NAME} SHARED
   gstmlmeta.c
   gstmlmodule.c
   gstmlpool.c
+  gstmlbundle.c
   ml-module-utils.c
-  ml-module-video-classification.c
-  ml-module-video-detection.c
-  ml-module-video-pose.c
-  ml-module-video-segmentation.c
-  ml-module-video-super-resolution.c
-  ml-module-audio-classification.c
+  ml-module-classification.c
+  ml-module-detection.c
+  ml-module-pose.c
+  ml-module-segmentation.c
+  ml-module-super-resolution.c
+  ml-module-classification.c
+  ml-post-process-classification.c
+  ml-post-process-keypoint.c
+  ml-post-process-detection.c
+  ml-post-process-pose.c
+  ml-post-process-segmentation.c
+  ml-post-process-depth-map.c
 )
 
 set(TARGET_HEADERS
@@ -29,13 +36,20 @@ set(TARGET_HEADERS
   gstmlmeta.h
   gstmlmodule.h
   gstmlpool.h
+  gstmlbundle.h
   ml-module-utils.h
-  ml-module-video-classification.h
-  ml-module-video-detection.h
-  ml-module-video-pose.h
-  ml-module-video-segmentation.h
-  ml-module-video-super-resolution.h
-  ml-module-audio-classification.h
+  ml-module-classification.h
+  ml-module-detection.h
+  ml-module-pose.h
+  ml-module-segmentation.h
+  ml-module-super-resolution.h
+  ml-module-classification.h
+  ml-post-process-classification.h
+  ml-post-process-keypoint.h
+  ml-post-process-detection.h
+  ml-post-process-pose.h
+  ml-post-process-segmentation.h
+  ml-post-process-depth-map.h
 )
 
 set_target_properties(${TARGET_NAME} PROPERTIES
@@ -62,6 +76,7 @@ target_link_libraries(${TARGET_NAME} PRIVATE
   ${GST_LIBRARIES}
   ${GST_ALLOC_LIBRARIES}
   ${GST_VIDEO_LIBRARIES}
+  gstqtivideobase
 )
 
 install(
@@ -73,16 +88,95 @@ install(
   PUBLIC_HEADER DESTINATION ${GST_PLUGINS_QTI_OSS_INSTALL_INCDIR}/gstreamer-1.0/gst/ml/
 )
 
-# Add destination of compiletime pkg-config file to PKG_CONFIG_PATH
-set(ENV{PKG_CONFIG_PATH} "${CMAKE_CURRENT_BINARY_DIR}:$ENV{PKG_CONFIG_PATH}")
+# Add destination of compile time pkg-config file to PKG_CONFIG_LOCAL_PATH
+list(APPEND PKG_CONFIG_LOCAL_PATH "${CMAKE_CURRENT_BINARY_DIR}")
+set(PKG_CONFIG_LOCAL_PATH "${PKG_CONFIG_LOCAL_PATH}" CACHE STRING "" FORCE)
 
 configure_file(
   ${QTI_PLUGINS_BASE_SOURCE_DIR}/common.pc.in
-  ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.pc
+  ${CMAKE_CURRENT_BINARY_DIR}/lib/pkgconfig/${PROJECT_NAME}.pc
   @ONLY
 )
 
 install(
-  FILES ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.pc
+  FILES ${CMAKE_CURRENT_BINARY_DIR}/lib/pkgconfig/${PROJECT_NAME}.pc
   DESTINATION ${GST_PLUGINS_QTI_OSS_INSTALL_LIBDIR}/pkgconfig
 )
+
+if(GIR_SCANNER AND GIR_COMPILER AND NOT HAVE_GBM_PRIV_H)
+  # Generate GIR and typelib files for Python
+  set(GIR_TARGET_NAME "GstQtiML-1.0.gir")
+
+  add_custom_command(
+    OUTPUT ${GIR_TARGET_NAME}
+    COMMAND ${GIR_SCANNER}
+            --warn-all --verbose
+            --namespace=GstQtiML
+            --nsversion=1.0
+            --identifier-prefix=GstML
+            --identifier-prefix=Gst
+            --symbol-prefix=gst_ml
+            --symbol-prefix=gst
+            --library=${TARGET_NAME}
+            --output=${GIR_TARGET_NAME}
+            --include=Gst-1.0
+            --include=GstVideo-1.0
+            --include=GstQtiVideo-1.0
+            --add-include-path=${QTI_PLUGINS_BASE_BINARY_DIR}/gst/utils
+            --add-include-path=${QTI_PLUGINS_BASE_BINARY_DIR}/gst/allocators
+            --add-include-path=${QTI_PLUGINS_BASE_BINARY_DIR}/gst/gfx
+            --add-include-path=${QTI_PLUGINS_BASE_BINARY_DIR}/gst/video
+            --cflags-begin -I${QTI_PLUGINS_BASE_SOURCE_DIR} --cflags-end
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-type.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-type.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-info.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-info.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-frame.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-frame.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/gstmlmeta.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/gstmlmeta.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/gstmlpool.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/gstmlpool.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/gstmlbundle.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/gstmlbundle.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-post-process-classification.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-post-process-classification.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-post-process-keypoint.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-post-process-keypoint.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-post-process-detection.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-post-process-detection.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-post-process-pose.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-post-process-pose.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-post-process-segmentation.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-post-process-segmentation.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-post-process-depth-map.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/ml-post-process-depth-map.c
+    DEPENDS ${TARGET_NAME}
+            GstQtiVideo-1.0
+  )
+
+  set(TYPELIB_TARGET_NAME "GstQtiML-1.0.typelib")
+
+  add_custom_command(
+    OUTPUT ${TYPELIB_TARGET_NAME}
+    COMMAND ${GIR_COMPILER} ${GIR_TARGET_NAME}
+            --includedir=${QTI_PLUGINS_BASE_BINARY_DIR}/gst/utils
+            --includedir=${QTI_PLUGINS_BASE_BINARY_DIR}/gst/allocators
+            --includedir=${QTI_PLUGINS_BASE_BINARY_DIR}/gst/gfx
+            --includedir=${QTI_PLUGINS_BASE_BINARY_DIR}/gst/video
+            --output=${TYPELIB_TARGET_NAME}
+    DEPENDS ${GIR_TARGET_NAME}
+  )
+
+  add_custom_target(GstQtiML-1.0 ALL DEPENDS ${TYPELIB_TARGET_NAME})
+
+  install(
+    FILES ${CMAKE_CURRENT_BINARY_DIR}/${GIR_TARGET_NAME}
+    DESTINATION ${GST_PLUGINS_QTI_OSS_INSTALL_DATADIR}/gir-1.0/
+  )
+
+  install(
+    FILES ${CMAKE_CURRENT_BINARY_DIR}/${TYPELIB_TARGET_NAME}
+    DESTINATION ${GST_PLUGINS_QTI_OSS_INSTALL_LIBDIR}/girepository-1.0/
+  )
+endif()

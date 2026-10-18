@@ -20,6 +20,10 @@ target_include_directories(${TARGET_NAME} PUBLIC
   ${GST_INCLUDE_DIRS}
 )
 
+target_include_directories(${TARGET_NAME} PRIVATE
+  ${KERNEL_MSM_INCDIR}
+)
+
 target_include_directories(${TARGET_NAME} INTERFACE
   $<BUILD_INTERFACE:${QTI_PLUGINS_BASE_SOURCE_DIR}>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_PREFIX}/include/gstreamer-1.0>
@@ -27,6 +31,7 @@ target_include_directories(${TARGET_NAME} INTERFACE
 
 target_compile_definitions(${TARGET_NAME} PRIVATE
   $<$<BOOL:${HAVE_LINUX_DMA_HEAP_H}>:HAVE_LINUX_DMA_HEAP_H>
+  $<$<BOOL:${HAVE_LINUX_MEM_BUF_H}>:HAVE_LINUX_MEM_BUF_H>
 )
 
 target_link_libraries(${TARGET_NAME} PRIVATE
@@ -43,16 +48,61 @@ install(
   PUBLIC_HEADER DESTINATION ${GST_PLUGINS_QTI_OSS_INSTALL_INCDIR}/gstreamer-1.0/gst/memory/
 )
 
-# Add destination of compiletime pkg-config file to PKG_CONFIG_PATH
-set(ENV{PKG_CONFIG_PATH} "${CMAKE_CURRENT_BINARY_DIR}:$ENV{PKG_CONFIG_PATH}")
+# Add destination of compile time pkg-config file to PKG_CONFIG_LOCAL_PATH
+list(APPEND PKG_CONFIG_LOCAL_PATH "${CMAKE_CURRENT_BINARY_DIR}")
+set(PKG_CONFIG_LOCAL_PATH "${PKG_CONFIG_LOCAL_PATH}" CACHE STRING "" FORCE)
 
 configure_file(
   ${QTI_PLUGINS_BASE_SOURCE_DIR}/common.pc.in
-  ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.pc
+  ${CMAKE_CURRENT_BINARY_DIR}/lib/pkgconfig/${PROJECT_NAME}.pc
   @ONLY
 )
 
 install(
-  FILES ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.pc
+  FILES ${CMAKE_CURRENT_BINARY_DIR}/lib/pkgconfig/${PROJECT_NAME}.pc
   DESTINATION ${GST_PLUGINS_QTI_OSS_INSTALL_LIBDIR}/pkgconfig
 )
+
+if(GIR_SCANNER AND GIR_COMPILER AND NOT HAVE_GBM_PRIV_H)
+  # Generate GIR and typelib files for Python
+  set(GIR_TARGET_NAME "GstQtiMemory-1.0.gir")
+
+  add_custom_command(
+    OUTPUT ${GIR_TARGET_NAME}
+    COMMAND ${GIR_SCANNER}
+            --warn-all --verbose
+            --namespace=GstQtiMemory
+            --nsversion=1.0
+            --identifier-prefix=GstMem
+            --identifier-prefix=Gst
+            --symbol-prefix=gst_mem
+            --symbol-prefix=gst
+            --library=${TARGET_NAME}
+            --output=${GIR_TARGET_NAME}
+            --include=Gst-1.0
+            --include=GstAllocators-1.0
+    ${CMAKE_CURRENT_SOURCE_DIR}/gstmempool.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/gstmempool.c
+    DEPENDS ${TARGET_NAME}
+  )
+
+  set(TYPELIB_TARGET_NAME "GstQtiMemory-1.0.typelib")
+
+  add_custom_command(
+    OUTPUT ${TYPELIB_TARGET_NAME}
+    COMMAND ${GIR_COMPILER} ${GIR_TARGET_NAME} --output=${TYPELIB_TARGET_NAME}
+    DEPENDS ${GIR_TARGET_NAME}
+  )
+
+  add_custom_target(GstQtiMemory-1.0 ALL DEPENDS ${TYPELIB_TARGET_NAME})
+
+  install(
+    FILES ${CMAKE_CURRENT_BINARY_DIR}/${GIR_TARGET_NAME}
+    DESTINATION ${GST_PLUGINS_QTI_OSS_INSTALL_DATADIR}/gir-1.0/
+  )
+
+  install(
+    FILES ${CMAKE_CURRENT_BINARY_DIR}/${TYPELIB_TARGET_NAME}
+    DESTINATION ${GST_PLUGINS_QTI_OSS_INSTALL_LIBDIR}/girepository-1.0/
+  )
+endif()

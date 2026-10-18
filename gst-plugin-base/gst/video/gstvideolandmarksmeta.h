@@ -59,8 +59,9 @@ struct _GstVideoKeypointLink {
  * @id: ID corresponding to the memory index inside GstBuffer.
  * @parent_id: Identifier of its parent ROI, used when this meta was derived.
  * @confidence: Confidence score for the landmarks group as a whole.
- * @keypoints: A #GArray of #GstVideoKeypoint
- * @links: A #GArray of #GstVideoKeypointLink
+ * @keypoints: (element-type GstVideoKeypoint): A #GArray of #GstVideoKeypoint
+ * @links: (optional) (element-type GstVideoKeypointLink):
+ *         A #GArray of #GstVideoKeypointLink
  * @xtraparams: (optional): A #GstStructure containing additional parameters.
  *
  * Extra buffer metadata describing multiple video keypoints and their linkages.
@@ -149,9 +150,10 @@ gst_buffer_get_video_landmarks_meta_id (GstBuffer * buffer, guint id);
  *
  * Buffers can contain multiple #GstVideoLandmarksMeta metadata items.
  *
- * Returns: (transfer full) (element-type GstVideoLandmarksMeta) (nullable):
+ * Returns: (transfer container) (element-type GstVideoLandmarksMeta) (nullable):
  *          list of #GstVideoLandmarksMeta with @parent_id or %NULL when there
- *          is no such metadata on @buffer.
+ *          is no such metadata on @buffer. Free the list with g_list_free();
+ *          the metadata items it holds remain owned by @buffer.
  */
 GST_VIDEO_API GList *
 gst_buffer_get_video_landmarks_metas_parent_id (GstBuffer * buffer,

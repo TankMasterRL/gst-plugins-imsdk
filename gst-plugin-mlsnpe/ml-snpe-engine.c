@@ -386,7 +386,6 @@ gst_ml_snpe_engine_setup_input_tensors (GstMLSnpeEngine *engine)
 
     if (!success) {
       GST_ERROR ("Failed to get attributes for input tensor '%s'!", name);
-      engine->IBufferAttributesDelete (attribs);
       goto cleanup;
     }
 
@@ -486,7 +485,6 @@ gst_ml_snpe_engine_setup_output_tensors (GstMLSnpeEngine *engine)
 
     if (!success) {
       GST_ERROR ("Failed to get attributes for output tensor '%s'!", name);
-      engine->IBufferAttributesDelete (attribs);
       return FALSE;
     }
 
@@ -1213,9 +1211,6 @@ gst_ml_snpe_engine_execute (GstMLSnpeEngine * engine,
 
     usrbuffer = engine->UserBufferMapGet (engine->inputs, name);
     engine->IUserBufferSetBufferAddress (usrbuffer, vaddress);
-
-    mlmeta = gst_buffer_get_ml_tensor_meta_id (inframe->buffer, idx);
-    mlmeta->name = g_quark_from_string (name);
   }
 
   engine->StringListDelete (names);

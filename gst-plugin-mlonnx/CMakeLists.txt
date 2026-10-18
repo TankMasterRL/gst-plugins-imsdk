@@ -9,16 +9,17 @@ set(CMAKE_INCLUDE_CURRENT_DIR ON)
 find_package(PkgConfig)
 
 # Get the pkgconfigs exported by the automake tools
+set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH ON)
+set(CMAKE_PREFIX_PATH "${PKG_CONFIG_LOCAL_PATH}")
+
 pkg_check_modules(GST REQUIRED
   gstreamer-1.0>=${GST_VERSION_REQUIRED})
 pkg_check_modules(GST_BASE REQUIRED
   gstreamer-base-1.0>=${GST_VERSION_REQUIRED})
 pkg_check_modules(GST_ALLOC REQUIRED
   gstreamer-allocators-1.0>=${GST_VERSION_REQUIRED})
-pkg_check_modules(GST_QCOM_ML
-  REQUIRED gstreamer-qcom-oss-ml-1.0>=1.0.0)
-pkg_check_modules(GST_QCOM_UTILS
-  REQUIRED gstreamer-qcom-oss-utils-1.0>=1.0.0)
+pkg_check_modules(GST_QCOM_ML REQUIRED gstreamer-qcom-oss-ml-1.0>=1.0.0)
+pkg_check_modules(GST_QCOM_UTILS REQUIRED gstreamer-qcom-oss-utils-1.0>=1.0.0)
 
 # Find ONNX Runtime using pkg-config
 pkg_check_modules(ONNXRUNTIME REQUIRED libonnxruntime)
@@ -38,15 +39,6 @@ if(NOT HAVE_ONNXPROTO_H)
   message(FATAL_ERROR "ONNX Proto headers not found.")
 endif()
 
-# Find qnn execution provider library
-find_library(QNNPROVIDERS_LIB onnxruntime_providers_qnn
-  PATHS ${CMAKE_SYSROOT}/${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}
-  NO_DEFAULT_PATH
-)
-if(NOT QNNPROVIDERS_LIB)
-  message(FATAL_ERROR "QNN Providers library not found.")
-endif()
-
 # Find ONNX proto library
 find_library(ONNX_PROTO_LIB onnx_proto
   PATHS ${CMAKE_SYSROOT}/${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}
@@ -63,7 +55,6 @@ list(APPEND GST_QTI_ML_ONNX_SRC
 
 list(APPEND TARGET_LIBRARIES
   ${ONNXRUNTIME_LIBRARIES}
-  ${QNNPROVIDERS_LIB}
 )
 
 # Add ONNX proto library if found

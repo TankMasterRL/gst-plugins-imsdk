@@ -1134,7 +1134,7 @@ gst_ml_qnn_engine_execute (GstMLQnnEngine *engine, GstMLFrame *inframe,
 {
   GstMLTensorMeta *mlmeta = NULL;
   const GraphInfo_t *graph_info = engine->graph_infos[0];
-  guint idx;
+  guint idx = 0, num = 0, size = 0;
 
   if (GST_ML_FRAME_N_BLOCKS (inframe) != engine->ininfo->n_tensors) {
     GST_WARNING ("Input buffer has %u memory blocks but engine requires %u!",
@@ -1158,9 +1158,12 @@ gst_ml_qnn_engine_execute (GstMLQnnEngine *engine, GstMLFrame *inframe,
   }
 
   // populate output tensor data
-  for (idx = 0; idx < graph_info->numOutputTensors; idx++) {
-    Qnn_Tensor_t *tensor = &(graph_info->outputTensors[idx]);
-    guint size = gst_ml_info_tensor_size (&(outframe->info), idx);
+  for (idx = 0; idx < engine->outinfo->n_tensors; idx++) {
+    num = (engine->graphindices != NULL) ?
+        g_array_index (engine->graphindices, guint, idx) : idx;
+
+    Qnn_Tensor_t *tensor = &(graph_info->outputTensors[num]);
+    size = gst_ml_info_tensor_size (&(outframe->info), idx);
 
     QNN_TENSOR_CLIENTBUF (tensor).data = GST_ML_FRAME_BLOCK_DATA (outframe, idx);
     QNN_TENSOR_CLIENTBUF (tensor).dataSize = size;
@@ -1177,23 +1180,11 @@ gst_ml_qnn_engine_execute (GstMLQnnEngine *engine, GstMLFrame *inframe,
     return FALSE;
   }
 
-  for (idx = 0; idx < engine->ininfo->n_tensors; ++idx) {
-    Qnn_Tensor_t *tensor = &(graph_info->inputTensors[idx]);
-
-    if (engine->graphindices != NULL) {
-      guint num = g_array_index (engine->graphindices, guint, idx);
-      tensor = &(graph_info->inputTensors[num]);
-    }
-
-    mlmeta = gst_buffer_get_ml_tensor_meta_id (inframe->buffer, idx);
-    mlmeta->name = g_quark_from_string (QNN_TENSOR_NAME (tensor));
-  }
-
   for (idx = 0; idx < engine->outinfo->n_tensors; ++idx) {
     Qnn_Tensor_t *tensor = &(graph_info->outputTensors[idx]);
 
     if (engine->graphindices != NULL) {
-      guint num = g_array_index (engine->graphindices, guint, idx);
+      num = g_array_index (engine->graphindices, guint, idx);
       tensor = &(graph_info->outputTensors[num]);
     }
 

@@ -1,15 +1,17 @@
 cmake_minimum_required(VERSION 3.16)
 project(gst-plugins-qti-oss LANGUAGES C CXX)
-set(GST_VERSION_REQUIRED "1.16")
+
+include(GNUInstallDirs)
 
 # Common point for setting version of all libs of gst-plugins-qcom package
+set(GST_VERSION_REQUIRED "1.16")
 set(GST_PLUGINS_QTI_OSS_VERSION "1.0")
 
 set(GST_PLUGINS_QTI_OSS_INSTALL_BINDIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}")
 set(GST_PLUGINS_QTI_OSS_INSTALL_LIBDIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}")
 set(GST_PLUGINS_QTI_OSS_INSTALL_INCDIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_INCLUDEDIR}")
+set(GST_PLUGINS_QTI_OSS_INSTALL_DATADIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATAROOTDIR}")
 set(GST_PLUGINS_QTI_OSS_INSTALL_CONFIG "${CMAKE_INSTALL_SYSCONFDIR}/configs")
-set(GST_PLUGINS_QTI_OSS_INSTALL_MEDIA "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATAROOTDIR}/qdemo")
 
 option(ENABLE_GST_IMSDK_PLUGINS "Enable IMSDK Plugins" OFF)
 
@@ -40,6 +42,7 @@ option(ENABLE_GST_PLUGIN_MSGBROKER "Enable gst-plugin-msgbroker" ${ENABLE_GST_ME
 option(ENABLE_GST_PLUGIN_METAMUX "Enable gst-plugin-metamux" ${ENABLE_GST_ML_PLUGINS})
 option(ENABLE_GST_PLUGIN_METATRANSFORM "Enable gst-plugin-metatransform" ${ENABLE_GST_ML_PLUGINS})
 option(ENABLE_GST_PLUGIN_MLACONVERTER "Enable gst-plugin-mlaconverter" ${ENABLE_GST_ML_PLUGINS})
+option(ENABLE_GST_PLUGIN_MLBIN "Enable gst-plugin-mlbin" ${ENABLE_GST_ML_PLUGINS})
 option(ENABLE_GST_PLUGIN_MLDEMUX "Enable gst-plugin-mldemux" ${ENABLE_GST_ML_PLUGINS})
 option(ENABLE_GST_PLUGIN_MLMETAEXTRACTOR "Enable gst-plugin-mlmetaextractor" ${ENABLE_GST_ML_PLUGINS})
 option(ENABLE_GST_PLUGIN_MLMETAPARSER "Enable gst-plugin-mlmetaparser" ${ENABLE_GST_ML_PLUGINS})
@@ -52,6 +55,7 @@ option(ENABLE_GST_PLUGIN_OBJTRACKER "Enable gst-plugin-objtracker" ${ENABLE_GST_
 option(ENABLE_GST_PLUGIN_RESTRICTED_ZONE "Enable gst-plugin-restricted-zone" ${ENABLE_GST_ML_PLUGINS})
 
 # QAIRT Plugins
+option(ENABLE_GST_PLUGIN_MLQAIRT "Enable gst-plugin-mlqairt" ${ENABLE_GST_QAIRT_PLUGINS})
 option(ENABLE_GST_PLUGIN_MLQNN "Enable gst-plugin-mlqnn" ${ENABLE_GST_QAIRT_PLUGINS})
 option(ENABLE_GST_PLUGIN_MLSNPE "Enable gst-plugin-mlsnpe" ${ENABLE_GST_QAIRT_PLUGINS})
 
@@ -71,10 +75,14 @@ option(ENABLE_GST_PLUGIN_VIDEOTEMPLATE "Enable gst-plugin-videotemplate" ${ENABL
 # Arducam ToF camera on the CAMSS RDI path (fork addition, DEC-0020)
 option(ENABLE_GST_PLUGIN_TOF "Enable gst-plugin-tof" OFF)
 
+# Python extension module
+option(ENABLE_GST_PYTHON "Enable gst-python libraries" OFF)
+
 # Sample Apps and Test Framework
 option(ENABLE_GST_PLUGIN_EXAMPLES "Enable gst-plugin-examples" OFF)
 option(ENABLE_GST_PYTHON_EXAMPLES "Enable gst-python-examples" OFF)
 option(ENABLE_GST_SAMPLE_APPS "Enable gst-sample-apps" OFF)
+option(ENABLE_GST_SAMPLE_APPS_CAMERA "Enable gst-sample-apps-camera" OFF)
 option(ENABLE_GST_PLUGIN_TOOLS "Enable gst-plugin-tools" OFF)
 option(ENABLE_GST_TEST_FRAMEWORK "Enable gst-test-framework" OFF)
 option(ENABLE_GST_UMD_DAEMON "Enable gst-umd-daemon" OFF)
@@ -120,9 +128,6 @@ else()
     # Define path to gst-plugins-base tree for header includes
     set(QTI_PLUGINS_BASE_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/gst-plugin-base)
 
-    # Define the path to the common pkg-config template file used by all base libraries
-    set(BASE_COMMON_PC_IN ${CMAKE_CURRENT_SOURCE_DIR}/gst-plugin-base/gst/common.pc.in)
-
     add_subdirectory(gst-plugin-base/gst/camera)
   endif()
 endif()
@@ -134,6 +139,9 @@ function(add_plugin_if option_var plugin_dir)
     add_subdirectory(${plugin_dir})
   endif()
 endfunction()
+
+# Python extension module
+add_plugin_if(ENABLE_GST_PYTHON                 gst-python)
 
 # Camera plugins
 add_plugin_if(ENABLE_GST_PLUGIN_CAMIMGREPROC    gst-plugin-camimgreproc)
@@ -151,10 +159,12 @@ add_plugin_if(ENABLE_GST_PLUGIN_MSGBROKER       gst-plugin-msgbroker)
 add_plugin_if(ENABLE_GST_PLUGIN_METAMUX         gst-plugin-metamux)
 add_plugin_if(ENABLE_GST_PLUGIN_METATRANSFORM   gst-plugin-metatransform)
 add_plugin_if(ENABLE_GST_PLUGIN_MLACONVERTER    gst-plugin-mlaconverter)
+add_plugin_if(ENABLE_GST_PLUGIN_MLBIN           gst-plugin-mlbin)
 add_plugin_if(ENABLE_GST_PLUGIN_MLDEMUX         gst-plugin-mldemux)
 add_plugin_if(ENABLE_GST_PLUGIN_MLMETAEXTRACTOR gst-plugin-mlmetaextractor)
 add_plugin_if(ENABLE_GST_PLUGIN_MLMETAPARSER    gst-plugin-mlmetaparser)
 add_plugin_if(ENABLE_GST_PLUGIN_MLPOSTPROCESS   gst-plugin-mlpostprocess)
+add_plugin_if(ENABLE_GST_PLUGIN_MLQAIRT         gst-plugin-mlqairt)
 add_plugin_if(ENABLE_GST_PLUGIN_MLQNN           gst-plugin-mlqnn)
 add_plugin_if(ENABLE_GST_PLUGIN_MLSNPE          gst-plugin-mlsnpe)
 add_plugin_if(ENABLE_GST_PLUGIN_MLTFLITE        gst-plugin-mltflite)
@@ -184,7 +194,9 @@ add_plugin_if(ENABLE_GST_PLUGIN_SMARTVENCBIN    gst-plugin-smartvencbin)
 # Sample Apps and Test Framework
 add_plugin_if(ENABLE_GST_PLUGIN_EXAMPLES        gst-plugin-examples)
 add_plugin_if(ENABLE_GST_PYTHON_EXAMPLES        gst-python-examples)
-add_plugin_if(ENABLE_GST_SAMPLE_APPS            gst-sample-apps)
+if(ENABLE_GST_SAMPLE_APPS OR ENABLE_GST_SAMPLE_APPS_CAMERA)
+  add_subdirectory(gst-sample-apps)
+endif()
 add_plugin_if(ENABLE_GST_SAMPLE_APPS            gst-sample-apps/gst-sample-apps-utils)
 add_plugin_if(ENABLE_GST_PLUGIN_TOOLS           gst-plugin-tools)
 add_plugin_if(ENABLE_GST_TEST_FRAMEWORK         gst-test-framework)

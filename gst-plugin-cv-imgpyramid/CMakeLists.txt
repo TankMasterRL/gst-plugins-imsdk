@@ -9,17 +9,15 @@ set(CMAKE_INCLUDE_CURRENT_DIR ON)
 find_package(PkgConfig)
 
 # Get the pkgconfigs exported by the automake tools
-pkg_check_modules(GST
-  REQUIRED gstreamer-1.0>=${GST_VERSION_REQUIRED})
-pkg_check_modules(GST_ALLOC
-  REQUIRED gstreamer-allocators-1.0>=${GST_VERSION_REQUIRED})
-pkg_check_modules(GST_VIDEO
-  REQUIRED gstreamer-video-1.0>=${GST_VERSION_REQUIRED})
+set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH ON)
+set(CMAKE_PREFIX_PATH "${PKG_CONFIG_LOCAL_PATH}")
+
+pkg_check_modules(GST REQUIRED gstreamer-1.0>=${GST_VERSION_REQUIRED})
+pkg_check_modules(GST_ALLOC REQUIRED gstreamer-allocators-1.0>=${GST_VERSION_REQUIRED})
+pkg_check_modules(GST_VIDEO REQUIRED gstreamer-video-1.0>=${GST_VERSION_REQUIRED})
 pkg_check_modules(GBM REQUIRED gbm)
-pkg_check_modules(GST_QCOM_UTILS
-  REQUIRED gstreamer-qcom-oss-utils-1.0>=1.0.0)
-pkg_check_modules(GST_QCOM_MEM
-  REQUIRED gstreamer-qcom-oss-memory-1.0>=1.0.0)
+pkg_check_modules(GST_QCOM_UTILS REQUIRED gstreamer-qcom-oss-utils-1.0>=1.0.0)
+pkg_check_modules(GST_QCOM_MEM REQUIRED gstreamer-qcom-oss-memory-1.0>=1.0.0)
 
 include(CheckIncludeFileCXX)
 # Check whether CVP pyramid header is present.
@@ -49,7 +47,9 @@ add_library(${GST_QTI_CV_IMGPYRAMID} SHARED
 target_compile_definitions(${GST_QTI_CV_IMGPYRAMID} PRIVATE
   HAVE_CONFIG_H
   $<$<BOOL:${HAVE_CVP_IMGPYRAMID_H}>:HAVE_CVP_IMGPYRAMID_H>
+  $<$<BOOL:${HAVE_CVP_IMGPYRAMID_H}>:HW_UTILIZATION="CVP">
   $<$<BOOL:${HAVE_EVA_IMGPYRAMID_H}>:HAVE_EVA_IMGPYRAMID_H>
+  $<$<BOOL:${HAVE_EVA_IMGPYRAMID_H}>:HW_UTILIZATION="EVA">
 )
 
 target_include_directories(${GST_QTI_CV_IMGPYRAMID} PUBLIC

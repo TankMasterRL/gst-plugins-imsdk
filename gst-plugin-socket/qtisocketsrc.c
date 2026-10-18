@@ -574,7 +574,7 @@ gst_socket_src_fill_buffer (GstFdSocketSrc * src, GstBuffer ** outbuf)
 
   if (src->mode != DATA_MODE_TEXT) {
     // Create a FD backed allocator.
-    allocator = gst_fd_allocator_new ();
+    allocator = gst_dmabuf_allocator_new ();
     if (allocator == NULL) {
       gst_buffer_unref (gstbuffer);
       g_free (release_data);
@@ -633,7 +633,8 @@ gst_socket_src_fill_buffer (GstFdSocketSrc * src, GstBuffer ** outbuf)
       }
 
       // Wrap our buffer memory block in FD backed memory.
-      gstmemory = gst_fd_allocator_alloc (allocator, fds[i], tensor_pl->maxsize,
+      gstmemory = gst_dmabuf_allocator_alloc_with_flags (
+          allocator, fds[i], tensor_pl->maxsize,
           pl_info.buffer_info->use_buffer_pool ?
           GST_FD_MEMORY_FLAG_DONT_CLOSE : GST_FD_MEMORY_FLAG_NONE);
       if (gstmemory == NULL) {
@@ -682,7 +683,8 @@ gst_socket_src_fill_buffer (GstFdSocketSrc * src, GstBuffer ** outbuf)
       }
 
       // Wrap our buffer memory block in FD backed memory.
-      gstmemory = gst_fd_allocator_alloc (allocator, fds[i], frame_pl->maxsize,
+      gstmemory = gst_dmabuf_allocator_alloc_with_flags (
+          allocator, fds[i], frame_pl->maxsize,
           pl_info.buffer_info->use_buffer_pool ?
           GST_FD_MEMORY_FLAG_DONT_CLOSE : GST_FD_MEMORY_FLAG_NONE);
       if (gstmemory == NULL) {
@@ -927,25 +929,25 @@ gst_socket_src_change_state (GstElement * element, GstStateChange transition)
   GstMessagePayload disc_msg = { .identity = MESSAGE_DISCONNECT};
   GstStateChangeReturn ret = GST_STATE_CHANGE_SUCCESS;
 
+  ret = GST_ELEMENT_CLASS (parent_class)->change_state (element, transition);
+  if (ret == GST_STATE_CHANGE_FAILURE) {
+    GST_ERROR_OBJECT (src, "Failure");
+    return ret;
+  }
+
   switch (transition) {
-    case GST_STATE_CHANGE_READY_TO_NULL:
-      gst_socket_src_flush_socket_queue (src);
-      gst_socket_src_socket_release (src);
-      break;
     case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
       msg_info.message = &disc_msg;
       if (send_socket_message (src->client_sock, &msg_info) < 0) {
         GST_INFO_OBJECT (src, "Unable to send disconnect message.");
       }
       break;
+    case GST_STATE_CHANGE_PAUSED_TO_READY:
+      gst_socket_src_flush_socket_queue (src);
+      gst_socket_src_socket_release (src);
+      break;
     default:
       break;
-  }
-
-  ret = GST_ELEMENT_CLASS (parent_class)->change_state (element, transition);
-  if (ret == GST_STATE_CHANGE_FAILURE) {
-    GST_ERROR_OBJECT (src, "Failure");
-    return ret;
   }
 
   return ret;
@@ -1021,6 +1023,8 @@ gst_socket_src_init (GstFdSocketSrc * src)
 
   g_cond_init (&src->cond);
   g_mutex_init (&src->mutex);
+
+  gst_base_src_set_live (GST_BASE_SRC (src), TRUE);
 
   gst_base_src_set_format (GST_BASE_SRC (src), GST_FORMAT_TIME);
   GST_DEBUG_CATEGORY_INIT (gst_socket_src_debug, "qtisocketsrc", 0,

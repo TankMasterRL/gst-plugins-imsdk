@@ -295,6 +295,7 @@ gst_ml_bin_link_plugins (GstMLBin * mlbin)
   } else {
     // Link the ghost/proxy pads of the bin to the appropriate elements.
     success = gst_ml_bin_ghost_pad_set_target (mlbin, gpad, mlpostprocess, "src");
+    gpad = GST_GHOST_PAD_CAST (GST_ELEMENT (mlbin)->sinkpads->data);
     success &= gst_ml_bin_ghost_pad_set_target (mlbin, gpad, inqueue, "sink");
   }
 
@@ -570,8 +571,6 @@ gst_ml_bin_init (GstMLBin * mlbin)
 
   gst_element_add_pad (GST_ELEMENT_CAST (mlbin), pad);
   gst_object_unref (template);
-
-  g_warning ("Currently image-segmentation post-process modules are not supported!");
 }
 
 static gboolean

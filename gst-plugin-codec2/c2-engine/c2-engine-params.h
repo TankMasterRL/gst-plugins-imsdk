@@ -32,6 +32,7 @@ typedef struct _GstC2QuantInit GstC2QuantInit;
 typedef struct _GstC2QuantRanges GstC2QuantRanges;
 typedef struct _GstC2QuantRectangle GstC2QuantRectangle;
 typedef struct _GstC2QuantRegions GstC2QuantRegions;
+typedef struct _GstC2QuantMbmapInfo GstC2QuantMbmapInfo;
 typedef struct _GstC2TemporalLayer GstC2TemporalLayer;
 #if (GST_VERSION_MAJOR >= 1) && (GST_VERSION_MINOR >= 18)
 typedef struct _GstC2HdrStaticMetadata GstC2HdrStaticMetadata;
@@ -65,6 +66,7 @@ enum {
   GST_C2_PARAM_QP_INIT,              // GstC2QuantInit
   GST_C2_PARAM_QP_RANGES,            // GstC2QuantRanges
   GST_C2_PARAM_ROI_ENCODE,           // GstC2QuantRegions
+  GST_C2_PARAM_ROI_MBMAP_INFO,       // GstC2QuantMbmapInfo
   GST_C2_PARAM_TRIGGER_SYNC_FRAME,   // gboolean
   GST_C2_PARAM_NATIVE_RECORDING,     // gboolean
   GST_C2_PARAM_TEMPORAL_LAYERING,    // GstC2TemporalLayer
@@ -94,6 +96,9 @@ enum {
   GST_C2_PARAM_OPERATING_FRAMERATE,  // gdouble
   GST_C2_PARAM_CHROMA_QP_OFFSET,     // gint32
   GST_C2_PARAM_NAL_LENGTH_BITSTREAM, // GstC2NalPrefixMode
+  GST_C2_PARAM_BITRATE_BOOST_MARGIN, // gint32
+  GST_C2_PARAM_ENCODING_MODE,        // GstC2EncodingMode
+  GST_C2_PARAM_CAC,                  // GstC2ContentAdaptiveCoding
 };
 
 typedef enum {
@@ -106,6 +111,7 @@ typedef enum {
   GST_C2_PROFILE_HEVC_MAIN,
   GST_C2_PROFILE_HEVC_MAIN10,
   GST_C2_PROFILE_HEVC_MAIN_STILL,
+  GST_C2_PROFILE_HEVC_MAIN10_STILL,
 
   GST_C2_PROFILE_AAC_LC,
   GST_C2_PROFILE_AAC_MAIN,
@@ -312,6 +318,21 @@ typedef enum {
   GST_C2_H265_HEV1,
 } GstC2StreamFormat;
 
+typedef enum {
+  GST_C2_ENCODING_MODE_DEFAULT,
+  GST_C2_ENCODING_MODE_PROSIGHT,
+  GST_C2_ENCODING_MODE_DEPTH,
+  GST_C2_ENCODING_MODE_LOOKAHEAD,
+} GstC2EncodingMode;
+
+typedef enum {
+  GST_C2_CAC_DEFAULT,
+  GST_C2_CAC_DISABLE_ALL,
+  GST_C2_CAC_ENABLE_8BIT,
+  GST_C2_CAC_ENABLE_10BIT,
+  GST_C2_CAC_ENABLE_ALL,
+} GstC2Cac;
+
 struct _GstC2PixelInfo {
   GstVideoFormat format;
   guint32        n_subframes;
@@ -352,20 +373,20 @@ struct _GstC2TileLayout {
 
 struct _GstC2QuantInit {
   gboolean i_frames_enable;
-  guint32  i_frames;
+  gint32   i_frames;
   gboolean p_frames_enable;
-  guint32  p_frames;
+  gint32   p_frames;
   gboolean b_frames_enable;
-  guint32  b_frames;
+  gint32   b_frames;
 };
 
 struct _GstC2QuantRanges {
-  guint32 min_i_qp;
-  guint32 max_i_qp;
-  guint32 min_p_qp;
-  guint32 max_p_qp;
-  guint32 min_b_qp;
-  guint32 max_b_qp;
+  gint32 min_i_qp;
+  gint32 max_i_qp;
+  gint32 min_p_qp;
+  gint32 max_p_qp;
+  gint32 min_b_qp;
+  gint32 max_b_qp;
 };
 
 struct _GstC2QuantRectangle {
@@ -382,6 +403,17 @@ struct _GstC2QuantRegions {
   guint64             timestamp;
 };
 
+struct _GstC2QuantMbmapInfo {
+  /// Flag to indicate whether enable mb map info to c2
+  gboolean enable;
+  /// Macroblock side length
+  guint8   mb_side_length;
+  /// Total number of macroblock
+  guint32  total_mbs;
+  /// Map indicating the region for QP bias
+  GArray   *qp_bias_map;
+};
+
 struct _GstC2TemporalLayer {
   guint32 n_layers;
   guint32 n_blayers;
@@ -390,10 +422,12 @@ struct _GstC2TemporalLayer {
 
 guint gst_c2_utils_h264_profile_from_string (const gchar * profile);
 guint gst_c2_utils_h265_profile_from_string (const gchar * profile);
+guint gst_c2_utils_heic_profile_from_string (const gchar * profile);
 guint gst_c2_utils_aac_profile_from_string (const gchar * profile);
 
 const gchar * gst_c2_utils_h264_profile_to_string (guint profile);
 const gchar * gst_c2_utils_h265_profile_to_string (guint profile);
+const gchar * gst_c2_utils_heic_profile_to_string (guint profile);
 const gchar * gst_c2_utils_aac_profile_to_string (guint profile);
 guint gst_c2_utils_aac_profile_to_aot (guint profile);
 

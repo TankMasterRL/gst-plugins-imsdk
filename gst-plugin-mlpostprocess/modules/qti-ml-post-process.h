@@ -103,8 +103,8 @@ typedef std::vector<Plane> Planes;
 /** VideoFrame:
  * @width: Width in pixels.
  * @height: Height in pixels.
- * @bits: The number of bits used to pack data items.
- * @n_components: The number of components in the video format.
+ * @bits: The number of bits used to pack data items. (not used)
+ * @n_components: The number of components in the video format. (not used)
  * @format: Color format.
  * @planes: Plane specific information.
  *
@@ -122,8 +122,11 @@ struct VideoFrame {
       : width(0), height(0), bits(0), n_components(0),
         format(VideoFormat::kGRAY8), planes(0) {};
 
-  VideoFrame(uint32_t width, uint32_t height, uint32_t bits, uint32_t n_components,
-      VideoFormat format, Planes& planes)
+  VideoFrame(uint32_t width, uint32_t height, VideoFormat format, Planes& planes)
+      : width(width), height(height), format(format), planes(planes) {};
+
+  VideoFrame(uint32_t width, uint32_t height, uint32_t bits,
+             uint32_t n_components, VideoFormat format, Planes& planes)
       : width(width), height(height), bits(bits), n_components(n_components),
         format(format), planes(planes) {};
 };
@@ -202,14 +205,21 @@ struct Tensor {
   float                 qoffset;
 
   Tensor()
-      : type(TensorType::kUint8), name("unknown"), dimensions(0), data(nullptr),
-        qscale(1.0), qoffset(0.0) {};
+      : type(TensorType::kUint8),
+        name("unknown"),
+        dimensions(0),
+        data(nullptr),
+        qscale(1.0),
+        qoffset(0.0) {};
 
-  Tensor(TensorType type, std::string name,
-         std::vector<uint32_t>& dimensions, void* data,
-         float qscale, float qoffset)
-      : type(type), name(name), dimensions(dimensions), data(data),
-        qscale(qscale), qoffset(qoffset) {};
+  Tensor(TensorType type, std::string name,std::vector<uint32_t>& dimensions,
+         void* data, float qscale, float qoffset)
+      : type(type),
+        name(name),
+        dimensions(dimensions),
+        data(data),
+        qscale(qscale),
+        qoffset(qoffset) {};
 };
 
 // Variable vector of tensor structures.
@@ -217,37 +227,6 @@ typedef std::vector<Tensor> Tensors;
 
 // Map between a parameter and its value: <parameter name, value>
 typedef std::unordered_map<std::string, std::any> Dictionary;
-
-/** TextGeneration:
- * @contents: The generated text.
- * @confidence: Percentage certainty that the prediction is accurate.
- * @color: Optional color that is associated with this prediction.
- * @xtraparams: Optional additional parameters in #Dictionary which the user
- *              can export from the submodule and be passed downstream.
- *
- * Information describing prediction result from text generation models.
- * All fields are mandatory and need to be filled by the submodule.
- */
-struct TextGeneration {
-  std::string               contents;
-  float                     confidence;
-
-  std::optional<uint32_t>   color;
-  std::optional<Dictionary> xtraparams;
-
-  TextGeneration()
-      : contents(), confidence(0) {};
-
-  TextGeneration(std::string& contents, float confidence)
-      : contents(contents), confidence(confidence) {};
-};
-
-// Variable vector of text generation structures.
-typedef std::vector<TextGeneration> TextGenerations;
-
-// Variable vector of Detection Entries.
-// Information describing a group of prediction results from the same tensor batch.
-typedef std::vector<TextGenerations> TextPrediction;
 
 /** AudioClassification:
  * @name: Name of the class prediction.
@@ -267,7 +246,7 @@ struct AudioClassification {
   std::optional<Dictionary> xtraparams;
 
   AudioClassification()
-      : name(), confidence(0) {};
+      : name("unknown"), confidence(0) {};
 
   AudioClassification(std::string name, float confidence)
       : name(name), confidence(confidence) {};
@@ -298,7 +277,7 @@ struct ImageClassification {
   std::optional<Dictionary> xtraparams;
 
   ImageClassification()
-      : name(), confidence(0) {};
+      : name("unknown"), confidence(0) {};
 
   ImageClassification(std::string name, float confidence)
       : name(name), confidence(confidence) {};
@@ -331,7 +310,7 @@ struct Keypoint {
   std::optional<uint32_t> color;
 
   Keypoint()
-      : name(), x(0), y(0), confidence(0.0) {};
+      : name("unknown"), x(0), y(0), confidence(0.0) {};
 
   Keypoint(std::string name, float x, float y, float confidence)
       : name(name), x(x), y(y), confidence(confidence) {};
@@ -381,7 +360,7 @@ struct PoseEstimation {
   std::optional<Dictionary>    xtraparams;
 
   PoseEstimation()
-      : name(), confidence(0), keypoints() {};
+      : name("unknown"), confidence(0), keypoints() {};
 
   PoseEstimation(std::string name, float confidence, Keypoints& keypoints)
       : name(name), confidence(confidence), keypoints(keypoints) {};
@@ -425,10 +404,13 @@ struct ObjectDetection {
   std::optional<Dictionary> xtraparams;
 
   ObjectDetection()
-      : name(), confidence(0), left(0), top(0), right(0), bottom(0) {};
+      : name("unknown"), confidence(0), left(0), top(0), right(0), bottom(0) {};
 
-  ObjectDetection(std::string name, float confidence, float left, float top,
-                      float right, float bottom)
+  ObjectDetection(float left, float top, float right, float bottom)
+      : left(left), top(top), right(right), bottom(bottom) {};
+
+  ObjectDetection(std::string& name, float confidence, float left, float top,
+                  float right, float bottom)
       : name(name),
         confidence(confidence),
         left(left),
@@ -443,6 +425,70 @@ typedef std::vector<ObjectDetection> ObjectDetections;
 // Variable vector of Detection Entries.
 // Information describing a group of prediction results from the same tensor batch.
 typedef std::vector<ObjectDetections> DetectionPrediction;
+
+/**
+ * Segmentation:
+ * @labels: List of class labels for each index in the segmentation mask.
+ * @colors: Colors for each index in the segmentation mask.
+ * @n_rows: Number of rows in the segmentation mask.
+ * @n_columns: Number of columns in the segmentation mask.
+ * @xtraparams: Optional additional parameters in #Dictionary which the user
+ *              can export from the submodule and be passed downstream.
+ *
+ * Information describing prediction result from image segmentation models.
+ * All fields are mandatory and need to be filled by the submodule.
+ */
+struct Segmentation {
+  std::vector<std::string>  labels;
+  std::vector<uint32_t>     colors;
+
+  uint32_t                  n_rows;
+  uint32_t                  n_columns;
+
+  std::optional<Dictionary> xtraparams;
+
+  Segmentation()
+      : labels(), colors(), n_rows(0), n_columns(0) {};
+
+  Segmentation(std::vector<std::string>& labels, std::vector<uint32_t>& colors,
+               uint32_t n_rows, uint32_t n_columns)
+      : labels(labels), colors(colors), n_rows(n_rows), n_columns(n_columns) {};
+};
+
+// Variable vector of image segmentation structures.
+typedef std::vector<Segmentation> Segmentations;
+
+/**
+ * DepthMap:
+ * @values: List of depth values for each index in the map.
+ * @colors: Colors for each index in the map.
+ * @n_rows: Number of rows in the map.
+ * @n_columns: Number of columns in the map.
+ * @xtraparams: Optional additional parameters in #Dictionary which the user
+ *              can export from the submodule and be passed downstream.
+ *
+ * Information describing prediction result from image depth models.
+ * All fields are mandatory and need to be filled by the submodule.
+ */
+struct DepthMap {
+  std::vector<double>       values;
+  std::vector<uint32_t>     colors;
+
+  uint32_t                  n_rows;
+  uint32_t                  n_columns;
+
+  std::optional<Dictionary> xtraparams;
+
+  DepthMap()
+      : values(), colors(), n_rows(0), n_columns(0) {};
+
+  DepthMap(std::vector<double>& values, std::vector<uint32_t>& colors,
+           uint32_t n_rows, uint32_t n_columns)
+      : values(values), colors(colors), n_rows(n_rows), n_columns(n_columns) {};
+};
+
+// Variable vector of image depth structures.
+typedef std::vector<DepthMap> DepthMaps;
 
 /** IModule
  *
@@ -491,22 +537,14 @@ class IModule {
    *        - 'input-tensor-region': Region
    *          Position and dimensions of the rectangle in the input tensor
    *          that was filled with data.
-   *    Text Generation:
-   *        - 'input-context-index': uint32_t
-   *          Optional index from in the input tensor from which the text
-   *          context tokens begin. Used to offset the indices for extraction
-   *          based models.
-   *        - 'input-context-tokens': std::vector<std::string>
-   *          Optional list with tokenized words of the text context given
-   *          as input to the model and required for extraction based models.
    * @output: Module specific output:
    *    Image Classification: Variable vector of ClassPrediction.
    *    Audio Classification: Variable vector of AudioClassPrediction.
    *    Object Detection: Variable vector of DetectionPrediction.
    *    Pose Estimation: Variable vector of PosePrediction.
-   *    Image Segmentation: Image mask represented by VideoFrame.
+   *    Image Segmentation: Variable vector of Segmentation.
+   *    Image Depth Map: Variable vector of DepthMap.
    *    Super Resolution: Scaled image represented by VideoFrame.
-   *    Text Generation: Variable vector of TextPrediction.
    *    Tensor Generation: Tensor output represented by Tensors.
    *
    * Process incoming buffer containing result tensors and converts that

@@ -113,6 +113,25 @@ gst_mlmeta_extractor_set_caps (GstBaseTransform * base, GstCaps * incaps,
   return TRUE;
 }
 
+static gboolean
+gst_mlmeta_extractor_propose_allocation (GstBaseTransform * base,
+    GstQuery * decide_query, GstQuery * query)
+{
+  GstMLMetaExtractor *extractor = GST_MLMETA_EXTRACTOR (base);
+
+  if (!GST_BASE_TRANSFORM_CLASS (parent_class)->propose_allocation (base,
+          decide_query, query))
+    return FALSE;
+
+  GST_DEBUG_OBJECT (extractor, "Proposing allocation with video meta support");
+
+  // Advertise GstVideoMeta support to enable upstream elements to send
+  // DMA-buf backed buffers, avoiding software buffer allocation and copies.
+  gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
+
+  return TRUE;
+}
+
 static GstFlowReturn
 gst_mlmeta_extractor_prepare_output_buffer (GstBaseTransform * base,
     GstBuffer * inbuffer, GstBuffer ** outbuffer)
@@ -309,7 +328,7 @@ gst_mlmeta_extractor_add_pose_structs_to_list (GstMLMetaExtractor * extractor,
   GstVideoRegionOfInterestMeta * parent_meta = NULL;
   GstStructure *structure = NULL;
   GList *list = NULL;
-  GValue poses = G_VALUE_INIT, value = G_VALUE_INIT;
+  GValue entries = G_VALUE_INIT, value = G_VALUE_INIT;
 
   if (parent_id != -1)
     parent_meta = gst_mlmeta_extractor_seek_parent_meta (extractor->roimetas,
@@ -318,7 +337,7 @@ gst_mlmeta_extractor_add_pose_structs_to_list (GstMLMetaExtractor * extractor,
   GST_DEBUG_OBJECT (extractor, "Received %d pose metas with parent_id %d",
       g_list_length (pmeta_list), parent_id);
 
-  g_value_init (&poses, GST_TYPE_ARRAY);
+  g_value_init (&entries, GST_TYPE_ARRAY);
 
   for (list = g_list_last (pmeta_list); list != NULL; list = list->prev) {
     GstVideoLandmarksMeta *pmeta = GST_VIDEO_LANDMARKS_META_CAST (list->data);
@@ -425,14 +444,14 @@ gst_mlmeta_extractor_add_pose_structs_to_list (GstMLMetaExtractor * extractor,
     g_value_init (&value, GST_TYPE_STRUCTURE);
 
     g_value_take_boxed (&value, pose);
-    gst_value_array_append_value (&poses, &value);
+    gst_value_array_append_value (&entries, &value);
     g_value_unset (&value);
   }
 
   structure = gst_structure_new_empty ("PoseEstimation");
 
-  gst_structure_set_value (structure, "poses", &poses);
-  g_value_unset (&poses);
+  gst_structure_set_value (structure, "poses", &entries);
+  g_value_unset (&entries);
 
   gst_structure_set (structure,
       "timestamp", G_TYPE_UINT64, timestamp,
@@ -656,6 +675,9 @@ gst_mlmeta_extractor_transform (GstBaseTransform * base, GstBuffer * inbuffer,
   gint string_len = 0;
   gint n_entries = 0, seq_index = 1;
   GstClockTime timestamp = GST_BUFFER_PTS (inbuffer);
+  GstClockTime time = GST_CLOCK_TIME_NONE;
+
+  time = gst_util_get_timestamp ();
 
   GST_TRACE_OBJECT (extractor, "Received %" GST_PTR_FORMAT, inbuffer);
 
@@ -724,6 +746,12 @@ gst_mlmeta_extractor_transform (GstBaseTransform * base, GstBuffer * inbuffer,
 
   GST_MLMETA_EXTRACTOR_UNLOCK (extractor);
 
+  time = GST_CLOCK_DIFF (time, gst_util_get_timestamp ());
+
+  GST_LOG_OBJECT (extractor, "Performance time %" G_GINT64_FORMAT ".%03"
+      G_GINT64_FORMAT " ms, HW utilization: CPU", GST_TIME_AS_MSECONDS (time),
+      (GST_TIME_AS_USECONDS (time) % 1000));
+
   return GST_FLOW_OK;
 }
 
@@ -765,6 +793,8 @@ gst_mlmeta_extractor_class_init (GstMLMetaExtractorClass * klass)
 
   base->transform_caps = GST_DEBUG_FUNCPTR (gst_mlmeta_extractor_transform_caps);
   base->set_caps = GST_DEBUG_FUNCPTR (gst_mlmeta_extractor_set_caps);
+  base->propose_allocation =
+      GST_DEBUG_FUNCPTR (gst_mlmeta_extractor_propose_allocation);
 
   base->transform = GST_DEBUG_FUNCPTR (gst_mlmeta_extractor_transform);
 }
