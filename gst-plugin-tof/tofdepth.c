@@ -22,6 +22,11 @@
  * group, the reference target's amplitude x m^2); a valid pixel whose amplitude is not above that bound plus
  * 3 wrap_sigma / sqrt (groups averaged) could be wrapped and becomes invalid, before the flying-pixel pass.
  *
+ * cpu-affinity / util-clamp-min (arducam-tof-ventuno RUN-0098): a scheduling hint for the streaming thread that calls the
+ * chain function (without a queue in front, qtitofsrc's), instead of taskset on the whole process. Applied with
+ * sched_setaffinity / sched_setattr (SCHED_FLAG_UTIL_CLAMP_MIN, unprivileged) when the first group arrives on a thread; that
+ * thread's previous CPU set and uclamp.min are restored at PAUSED -> READY or when another thread takes over. Unset = no call.
+ *
  * Pads: "src" (always) depth, GRAY16_LE millimetres or a colour-mapped view; "amplitude" and
  * "confidence" (request); "pointcloud" (request, RUN-0086): the QIM SDK tensor format
  * (neural-network/tensors, FLOAT32, 1 x 180 x 240 x 3 + GstMLTensorMeta), per pixel X, Y, Z in metres
@@ -31,6 +36,10 @@
  * (videotransform.c pattern).
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE             /* sched_setaffinity, CPU_SET, gettid */
+#endif
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -38,8 +47,12 @@
 #include "tofdepth.h"
 #include "tofdcs.h"
 
+#include <errno.h>
 #include <math.h>
+#include <sched.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #if defined(__aarch64__) && defined(__ARM_NEON) && G_BYTE_ORDER == G_LITTLE_ENDIAN
 #include <arm_neon.h>
@@ -72,6 +85,7 @@ GST_DEBUG_CATEGORY_STATIC (gst_tof_depth_debug);
 #define DEFAULT_WRAP_REFLECTIVITY 0.0
 #define WRAP_NOISE_Z             3.0     /* noise allowance in sigma (RUN-0090) */
 #define DEFAULT_PROCESSING_LATENCY -1
+#define DEFAULT_UTIL_CLAMP_MIN   -1
 /* automatic processing latency: live p99 after the source push, NEON build, unpinned (arducam-tof-ventuno
  * RUN-0064): ~6 ms with one output, ~9.3 ms for the third of three (max 11.2) */
 #define AUTO_LATENCY_BASE        (4 * GST_MSECOND)
@@ -124,8 +138,28 @@ enum
   PROP_DEPTH_TYPE,
   PROP_LENS,
   PROP_PROCESSING_LATENCY,
+  PROP_CPU_AFFINITY,
+  PROP_UTIL_CLAMP_MIN,
   PROP_STATS,
 };
+
+/* struct sched_attr of the kernel ABI (SCHED_ATTR_SIZE_VER1, include/uapi/linux/sched/types.h): glibc before 2.41 has no
+ * sched_setattr wrapper */
+typedef struct
+{
+  guint32 size;
+  guint32 sched_policy;
+  guint64 sched_flags;
+  gint32 sched_nice;
+  guint32 sched_priority;
+  guint64 sched_runtime, sched_deadline, sched_period;
+  guint32 sched_util_min, sched_util_max;
+} TofSchedAttr;
+
+#define TOF_SCHED_FLAG_KEEP_POLICY    0x08
+#define TOF_SCHED_FLAG_KEEP_PARAMS    0x10
+#define TOF_SCHED_FLAG_UTIL_CLAMP_MIN 0x20
+#define TOF_UTIL_CLAMP_RESET          G_MAXUINT32       /* (u32) -1: back to the default request */
 
 typedef struct
 {
@@ -172,6 +206,20 @@ struct _GstTofDepth
   gchar *lens;                  /* key file with [lens], NULL = the calibration's [lens] group if any */
   gchar *lens_used;             /* file in use, NULL = no lens (stats) */
   gint64 processing_latency;    /* ns, -1 = automatic */
+  gchar *cpu_affinity;          /* CPU list for the streaming thread, NULL or "" = leave it alone */
+  gint util_clamp_min;          /* uclamp.min for the streaming thread, -1 = leave it alone */
+
+  /* thread hint: set at READY -> PAUSED, applied by the streaming thread, undone at PAUSED -> READY */
+  gboolean hint_cpus;           /* hint_set is to be applied */
+  cpu_set_t hint_set;
+  gint hint_util_min;
+  GThread *hint_thread;         /* thread the hint was applied to, NULL = none */
+  pid_t hint_tid;
+  gboolean saved_cpus_valid;
+  cpu_set_t saved_set;          /* the thread's CPU set before the hint */
+  gint saved_util_min;          /* the thread's uclamp.min before the hint, -1 = not changed */
+  gchar *thread_cpus;           /* read back after applying (stats, object lock), NULL = no hint */
+  gint thread_util_min;         /* read back after applying (stats, object lock), -1 = no hint */
 
   /* stream state (streaming thread) */
   TofModel models[2];
@@ -1276,6 +1324,183 @@ push_output (GstTofDepth * self, TofOut * out, guint idx, guint mode, GstBuffer 
   return gst_pad_push (out->pad, buf);
 }
 
+/* ---------------------------------------------------------------- thread hint */
+
+/* "0-3", "2,3", "0-1,6" (the list format of taskset -c and Cpus_allowed_list); every CPU must exist on this board */
+static gboolean
+parse_cpu_list (const gchar * list, cpu_set_t * set, glong * n_cpu)
+{
+  gchar **parts = g_strsplit (list, ",", -1);
+  gboolean ok = parts[0] != NULL;
+
+  *n_cpu = sysconf (_SC_NPROCESSORS_CONF);
+  CPU_ZERO (set);
+  for (guint i = 0; ok && parts[i]; i++) {
+    gchar *s = g_strstrip (parts[i]), *end;
+    guint64 a, b;
+
+    if (!g_ascii_isdigit (*s)) {
+      ok = FALSE;
+      break;
+    }
+    a = b = g_ascii_strtoull (s, &end, 10);
+    if (*end == '-') {
+      s = end + 1;
+      if (!g_ascii_isdigit (*s)) {
+        ok = FALSE;
+        break;
+      }
+      b = g_ascii_strtoull (s, &end, 10);
+    }
+    if (*end != '\0' || b < a || b >= (guint64) MIN (*n_cpu, CPU_SETSIZE)) {
+      ok = FALSE;
+      break;
+    }
+    for (guint64 c = a; c <= b; c++)
+      CPU_SET (c, set);
+  }
+  g_strfreev (parts);
+  return ok;
+}
+
+static gchar *
+format_cpu_list (const cpu_set_t * set)
+{
+  GString *s = g_string_new (NULL);
+
+  for (gint c = 0; c < CPU_SETSIZE; c++) {
+    gint e = c;
+
+    if (!CPU_ISSET (c, set))
+      continue;
+    while (e + 1 < CPU_SETSIZE && CPU_ISSET (e + 1, set))
+      e++;
+    g_string_append_printf (s, "%s%d", s->len ? "," : "", c);
+    if (e > c)
+      g_string_append_printf (s, "-%d", e);
+    c = e;
+  }
+  return g_string_free (s, FALSE);
+}
+
+static gint
+get_util_min (pid_t tid)
+{
+  TofSchedAttr a = { 0, };
+
+  if (syscall (SYS_sched_getattr, tid, &a, sizeof (a), 0) != 0)
+    return -1;
+  return (gint) a.sched_util_min;
+}
+
+static gboolean
+set_util_min (pid_t tid, guint32 value)
+{
+  TofSchedAttr a = { 0, };
+
+  a.size = sizeof (a);
+  a.sched_flags = TOF_SCHED_FLAG_KEEP_POLICY | TOF_SCHED_FLAG_KEEP_PARAMS | TOF_SCHED_FLAG_UTIL_CLAMP_MIN;
+  a.sched_util_min = value;
+  return syscall (SYS_sched_setattr, tid, &a, 0) == 0;
+}
+
+/* READY -> PAUSED: take the properties for this stream; an invalid CPU list stops the start */
+static gboolean
+thread_hint_prepare (GstTofDepth * self)
+{
+  gchar *list;
+  glong n_cpu;
+  gboolean ok = TRUE;
+
+  GST_OBJECT_LOCK (self);
+  list = g_strdup (self->cpu_affinity);
+  self->hint_util_min = self->util_clamp_min;
+  GST_OBJECT_UNLOCK (self);
+  self->hint_cpus = list && *list;
+  if (self->hint_cpus && !parse_cpu_list (list, &self->hint_set, &n_cpu)) {
+    GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("cpu-affinity \"%s\" is not a CPU list of this board.", list),
+        ("Use the format of taskset -c, e.g. \"0-3\" or \"2,3\"; this board has CPUs 0-%ld.", n_cpu - 1));
+    ok = FALSE;
+  }
+  g_free (list);
+  return ok;
+}
+
+/* undo the hint on the thread it was applied to, if that thread still exists in this process */
+static void
+thread_hint_restore (GstTofDepth * self)
+{
+  gchar *task;
+
+  if (!self->hint_thread)
+    return;
+  task = g_strdup_printf ("/proc/self/task/%d", (gint) self->hint_tid);
+  if (g_file_test (task, G_FILE_TEST_EXISTS)) {
+    if (self->saved_cpus_valid && sched_setaffinity (self->hint_tid, sizeof (cpu_set_t), &self->saved_set) != 0)
+      GST_WARNING_OBJECT (self, "thread %d: CPU set not restored: %s", (gint) self->hint_tid, g_strerror (errno));
+    /* a previous 0 is the default request: reset rather than pin it */
+    if (self->saved_util_min >= 0 && !set_util_min (self->hint_tid,
+            self->saved_util_min ? (guint32) self->saved_util_min : TOF_UTIL_CLAMP_RESET))
+      GST_WARNING_OBJECT (self, "thread %d: uclamp.min not restored: %s", (gint) self->hint_tid, g_strerror (errno));
+  }
+  g_free (task);
+  self->hint_thread = NULL;
+  self->saved_cpus_valid = FALSE;
+  self->saved_util_min = -1;
+  GST_OBJECT_LOCK (self);
+  g_clear_pointer (&self->thread_cpus, g_free);
+  self->thread_util_min = -1;
+  GST_OBJECT_UNLOCK (self);
+}
+
+/* streaming thread, once per thread: apply cpu-affinity / util-clamp-min and remember what the thread had */
+static void
+thread_hint_apply (GstTofDepth * self)
+{
+  GThread *thread = g_thread_self ();
+  pid_t tid;
+  cpu_set_t now;
+  gchar *cpus = NULL;
+  gint util, err;
+
+  if (thread == self->hint_thread)
+    return;
+  thread_hint_restore (self);   /* another thread took over */
+  tid = gettid ();
+  self->hint_thread = thread;
+  self->hint_tid = tid;
+  if (self->hint_cpus) {
+    if (sched_getaffinity (tid, sizeof (cpu_set_t), &self->saved_set) == 0 &&
+        sched_setaffinity (tid, sizeof (cpu_set_t), &self->hint_set) == 0) {
+      self->saved_cpus_valid = TRUE;
+    } else {
+      err = errno;
+      GST_ELEMENT_WARNING (self, RESOURCE, SETTINGS, ("Cannot apply cpu-affinity to the streaming thread."),
+          ("sched_setaffinity: %s", g_strerror (err)));
+    }
+  }
+  if (self->hint_util_min >= 0) {
+    gint prev = get_util_min (tid);
+
+    if (prev >= 0 && set_util_min (tid, (guint32) self->hint_util_min)) {
+      self->saved_util_min = prev;
+    } else {
+      err = errno;
+      GST_ELEMENT_WARNING (self, RESOURCE, SETTINGS, ("Cannot apply util-clamp-min to the streaming thread."),
+          ("sched_setattr: %s", g_strerror (err)));
+    }
+  }
+  if (sched_getaffinity (tid, sizeof (cpu_set_t), &now) == 0)
+    cpus = format_cpu_list (&now);
+  util = get_util_min (tid);
+  GST_INFO_OBJECT (self, "streaming thread %d: CPUs %s, uclamp.min %d", (gint) tid, GST_STR_NULL (cpus), util);
+  GST_OBJECT_LOCK (self);
+  g_free (self->thread_cpus);
+  self->thread_cpus = cpus;
+  self->thread_util_min = util;
+  GST_OBJECT_UNLOCK (self);
+}
+
 /* ---------------------------------------------------------------- pads */
 
 static GstFlowReturn
@@ -1290,6 +1515,8 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   gboolean to_z;
   guint64 t0 = g_get_monotonic_time ();
 
+  if (self->hint_cpus || self->hint_util_min >= 0)
+    thread_hint_apply (self);
   if (!self->models_loaded && !load_models (self)) {
     gst_buffer_unref (inbuf);
     return GST_FLOW_ERROR;
@@ -1571,7 +1798,7 @@ gst_tof_depth_change_state (GstElement * element, GstStateChange transition)
   GstStateChangeReturn ret;
 
   if (transition == GST_STATE_CHANGE_READY_TO_PAUSED) {
-    if (!load_models (self))
+    if (!thread_hint_prepare (self) || !load_models (self))
       return GST_STATE_CHANGE_FAILURE;
     if (self->outs[OUT_POINTCLOUD].pad && !self->zscale) {
       GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("The pointcloud output needs a lens model."),
@@ -1594,6 +1821,8 @@ gst_tof_depth_change_state (GstElement * element, GstStateChange transition)
     }
     gst_clear_event (&self->stream_start);
     self->models_loaded = FALSE;
+    /* the pads are inactive now, so no chain call runs on the hinted thread */
+    thread_hint_restore (self);
   }
   return ret;
 }
@@ -1652,6 +1881,13 @@ gst_tof_depth_set_property (GObject * object, guint prop_id, const GValue * valu
     case PROP_PROCESSING_LATENCY:
       self->processing_latency = g_value_get_int64 (value);
       break;
+    case PROP_CPU_AFFINITY:
+      g_free (self->cpu_affinity);
+      self->cpu_affinity = g_value_dup_string (value);
+      break;
+    case PROP_UTIL_CLAMP_MIN:
+      self->util_clamp_min = g_value_get_int (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -1708,6 +1944,12 @@ gst_tof_depth_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_PROCESSING_LATENCY:
       g_value_set_int64 (value, self->processing_latency);
       break;
+    case PROP_CPU_AFFINITY:
+      g_value_set_string (value, self->cpu_affinity);
+      break;
+    case PROP_UTIL_CLAMP_MIN:
+      g_value_set_int (value, self->util_clamp_min);
+      break;
     case PROP_STATS:
       g_value_take_boxed (value, gst_structure_new ("stats",
               "groups", G_TYPE_UINT64, self->n_groups,
@@ -1717,7 +1959,9 @@ gst_tof_depth_get_property (GObject * object, guint prop_id, GValue * value,
               "flying-pixels", G_TYPE_UINT64, self->n_flying,
               "wrap-flagged", G_TYPE_UINT64, self->n_wrap,
               "mean-process-us", G_TYPE_DOUBLE,
-              self->n_groups ? self->proc_ns / 1000.0 / self->n_groups : 0.0, NULL));
+              self->n_groups ? self->proc_ns / 1000.0 / self->n_groups : 0.0,
+              "thread-cpus", G_TYPE_STRING, self->thread_cpus ? self->thread_cpus : "",
+              "thread-util-clamp-min", G_TYPE_INT, self->thread_util_min, NULL));
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -1735,6 +1979,8 @@ gst_tof_depth_finalize (GObject * object)
   g_free (self->calibration_used);
   g_free (self->lens);
   g_free (self->lens_used);
+  g_free (self->cpu_affinity);
+  g_free (self->thread_cpus);
   g_free (self->zscale);
   g_free (self->rayx);
   g_free (self->rayy);
@@ -1819,9 +2065,22 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
           "Time (ns) from a group's arrival to its outputs, added to the latency query; -1 = automatic "
           "(4 ms + 2.5 ms per linked output)", -1, GST_SECOND, DEFAULT_PROCESSING_LATENCY,
           rw | GST_PARAM_MUTABLE_PLAYING));
+  g_object_class_install_property (gobject_class, PROP_CPU_AFFINITY,
+      g_param_spec_string ("cpu-affinity", "CPU affinity",
+          "CPUs the streaming thread that runs this element may use, a list as for taskset -c (\"0-3\" = the "
+          "Cortex-A78C cores of the VENTUNO Q); without a queue in front this is also qtitofsrc's thread. Applied when "
+          "the first group arrives, undone at stop; unset = the thread is left alone", NULL,
+          rw | GST_PARAM_MUTABLE_READY));
+  g_object_class_install_property (gobject_class, PROP_UTIL_CLAMP_MIN,
+      g_param_spec_int ("util-clamp-min", "Utilisation clamp minimum",
+          "Minimum utilisation (0-1024) the scheduler assumes for the streaming thread that runs this element "
+          "(Linux uclamp.min): it prefers cores of at least this capacity and schedutil keeps their clock up to it. "
+          "Applied when the first group arrives, undone at stop; -1 = the thread is left alone", -1, 1024,
+          DEFAULT_UTIL_CLAMP_MIN, rw | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_STATS,
       g_param_spec_boxed ("stats", "Statistics", "groups, calibration (file in use, \"\" = none), depth-type, lens (file in use, \"\" = none), "
-          "flying-pixels (removed in all), wrap-flagged (removed in all), mean-process-us",
+          "flying-pixels (removed in all), wrap-flagged (removed in all), mean-process-us, thread-cpus and "
+          "thread-util-clamp-min (the streaming thread's, read back after applying a hint; \"\" / -1 = no hint)",
           GST_TYPE_STRUCTURE, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_add_static_pad_template (element_class, &sink_template);
@@ -1878,6 +2137,8 @@ gst_tof_depth_init (GstTofDepth * self)
   self->wrap_reflectivity = DEFAULT_WRAP_REFLECTIVITY;
   self->depth_type = GST_TOF_DEPTH_RADIAL;
   self->processing_latency = DEFAULT_PROCESSING_LATENCY;
+  self->util_clamp_min = DEFAULT_UTIL_CLAMP_MIN;
+  self->hint_util_min = self->saved_util_min = self->thread_util_min = -1;
   self->fps_n = 30;
   self->fps_d = 1;
   self->hist_mode = -1;

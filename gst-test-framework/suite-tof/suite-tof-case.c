@@ -19,11 +19,20 @@
  *                 a FLOAT32 1x180x240x3 tensor (gst_ml_info_from_caps), a tensor meta, every valid point within 0.1 mm
  *                 of r (x, y, 1) / |(x, y, 1)|, invalid points NaN, the same with depth-type=z; no lens -> no start
  *                 (arducam-tof-ventuno RUN-0086)
+ *   thread-hint   cpu-affinity=1-2 util-clamp-min=300: the pushing thread gets them (read back from the kernel and in
+ *                 the stats), a second pushing thread takes them over and the first gets its own back, teardown
+ *                 restores; no hint = no change; an invalid CPU list stops the start (arducam-tof-ventuno RUN-0098)
  * The live cases need the Arducam ToF on CAMERA0 with the ToF boot entry and drivers loaded.
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE             /* sched_getaffinity, CPU_SET */
+#endif
+
 #include <math.h>
+#include <sched.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <glib/gstdio.h>
 
@@ -825,6 +834,136 @@ GST_START_TEST (test_tof_wrap)
 }
 GST_END_TEST;
 
+/* uclamp.min of the calling thread (sched_getattr; struct sched_attr, SCHED_ATTR_SIZE_VER1) */
+static gint
+own_util_min (void)
+{
+  struct
+  {
+    guint32 size, policy;
+    guint64 flags;
+    gint32 nice;
+    guint32 priority;
+    guint64 runtime, deadline, period;
+    guint32 util_min, util_max;
+  } a = { 0, };
+
+  fail_unless (syscall (SYS_sched_getattr, 0, &a, sizeof (a), 0) == 0);
+  return (gint) a.util_min;
+}
+
+typedef struct
+{
+  GstHarness *h;
+  cpu_set_t cpus;
+  gint util;
+  GstFlowReturn flow;
+} HintPush;
+
+static gpointer
+hint_push_thread (gpointer data)
+{
+  HintPush *hp = data;
+
+  hp->flow = gst_harness_push (hp->h, synthetic_group (1, 200.0));
+  sched_getaffinity (0, sizeof (cpu_set_t), &hp->cpus);
+  hp->util = own_util_min ();
+  return NULL;
+}
+
+static void
+check_hint_stats (GstElement * el, const gchar * cpus, gint util)
+{
+  GstStructure *stats;
+  gint got = -2;
+
+  g_object_get (el, "stats", &stats, NULL);
+  fail_unless_equals_string (gst_structure_get_string (stats, "thread-cpus"), cpus);
+  fail_unless (gst_structure_get_int (stats, "thread-util-clamp-min", &got));
+  fail_unless_equals_int (got, util);
+  gst_structure_free (stats);
+}
+
+GST_START_TEST (test_tof_thread_hint)
+{
+  const gchar *bad[] = { "0-99", "abc", "3-1", "1,", "-1", "1-", " " };
+  cpu_set_t before, now, want;
+  gint util_before = own_util_min ();
+  GstHarness *h;
+  GstElement *el;
+  GThread *t;
+  HintPush hp = { 0, };
+
+  fail_unless (sched_getaffinity (0, sizeof (before), &before) == 0);
+  fail_unless (util_before != 300);
+  CPU_ZERO (&want);
+  CPU_SET (1, &want);
+  CPU_SET (2, &want);
+  fail_if (CPU_EQUAL (&before, &want), "the test thread is already on CPUs 1-2");
+
+  /* the hint lands on the thread that pushes (here this one) and shows in the stats */
+  h = gst_harness_new_parse ("qtitofdepth calibration=\"\" cpu-affinity=1-2 util-clamp-min=300");
+  el = gst_harness_find_element (h, "qtitofdepth");
+  gst_harness_set_src_caps_str (h, TOF_DCS_CAPS);
+  gst_harness_set_sink_caps_str (h,
+      "video/x-raw, format=(string)GRAY16_LE, width=(int)240, height=(int)180, framerate=(fraction)30/1");
+  check_hint_stats (el, "", -1);
+  fail_unless_equals_int (gst_harness_push (h, synthetic_group (1, 200.0)), GST_FLOW_OK);
+  gst_buffer_unref (gst_harness_pull (h));
+  fail_unless (sched_getaffinity (0, sizeof (now), &now) == 0);
+  fail_unless (CPU_EQUAL (&now, &want), "affinity not applied");
+  fail_unless_equals_int (own_util_min (), 300);
+  check_hint_stats (el, "1-2", 300);
+
+  /* another thread takes over: it gets the hint, this one its own values back */
+  hp.h = h;
+  t = g_thread_new ("hint-push", hint_push_thread, &hp);
+  g_thread_join (t);
+  fail_unless_equals_int (hp.flow, GST_FLOW_OK);
+  gst_buffer_unref (gst_harness_pull (h));
+  fail_unless (CPU_EQUAL (&hp.cpus, &want), "affinity not applied to the second thread");
+  fail_unless_equals_int (hp.util, 300);
+  fail_unless (sched_getaffinity (0, sizeof (now), &now) == 0);
+  fail_unless (CPU_EQUAL (&now, &before), "affinity not restored after the takeover");
+  fail_unless_equals_int (own_util_min (), util_before);
+
+  /* back on this thread, then stop: restored */
+  fail_unless_equals_int (gst_harness_push (h, synthetic_group (1, 200.0)), GST_FLOW_OK);
+  gst_buffer_unref (gst_harness_pull (h));
+  fail_unless_equals_int (own_util_min (), 300);
+  gst_object_unref (el);
+  gst_harness_teardown (h);
+  fail_unless (sched_getaffinity (0, sizeof (now), &now) == 0);
+  fail_unless (CPU_EQUAL (&now, &before), "affinity not restored at stop");
+  fail_unless_equals_int (own_util_min (), util_before);
+
+  /* no hint: the thread is left alone */
+  h = gst_harness_new_parse ("qtitofdepth calibration=\"\"");
+  el = gst_harness_find_element (h, "qtitofdepth");
+  gst_harness_set_src_caps_str (h, TOF_DCS_CAPS);
+  gst_harness_set_sink_caps_str (h,
+      "video/x-raw, format=(string)GRAY16_LE, width=(int)240, height=(int)180, framerate=(fraction)30/1");
+  fail_unless_equals_int (gst_harness_push (h, synthetic_group (1, 200.0)), GST_FLOW_OK);
+  gst_buffer_unref (gst_harness_pull (h));
+  fail_unless (sched_getaffinity (0, sizeof (now), &now) == 0);
+  fail_unless (CPU_EQUAL (&now, &before));
+  fail_unless_equals_int (own_util_min (), util_before);
+  check_hint_stats (el, "", -1);
+  gst_object_unref (el);
+  gst_harness_teardown (h);
+
+  /* an invalid CPU list stops the start */
+  for (guint i = 0; i < G_N_ELEMENTS (bad); i++) {
+    el = gst_element_factory_make ("qtitofdepth", NULL);
+    g_object_set (el, "calibration", "", "cpu-affinity", bad[i], NULL);
+    fail_unless (gst_element_set_state (el, GST_STATE_PAUSED) == GST_STATE_CHANGE_FAILURE,
+        "cpu-affinity \"%s\" accepted", bad[i]);
+    gst_element_set_state (el, GST_STATE_NULL);
+    gst_object_unref (el);
+  }
+}
+GST_END_TEST;
+
 static Suite *
 tof_suite (GList ** tcnames, gint iteration, gint duration)
 {
@@ -877,6 +1016,12 @@ tof_suite (GList ** tcnames, gint iteration, gint duration)
   *tcnames = g_list_append (*tcnames, (gpointer) tcname);
   suite_add_tcase (s, tc);
   tcase_add_loop_test (tc, test_tof_wrap, start, end);
+
+  tcname = "thread-hint";
+  tc = tcase_create (tcname);
+  *tcnames = g_list_append (*tcnames, (gpointer) tcname);
+  suite_add_tcase (s, tc);
+  tcase_add_loop_test (tc, test_tof_thread_hint, start, end);
 
   tcname = "stream";
   tc = tcase_create (tcname);
