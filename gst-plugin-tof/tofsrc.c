@@ -14,6 +14,12 @@
  * and after a range write every group whose first frame starts less than settle-time after the write
  * (measured: groups starting <= 17 ms after it are in the old mode, 37-39 ms old, mixed or blank,
  * >= 49 ms in the new mode).
+ *
+ * far-reference-interval (arducam-tof-ventuno RUN-0105/RUN-0106): with range=near, after N pushed near groups the
+ * source writes far and, after the next pushed far group, near again (the same write and settle-time drop as a range
+ * change). That far group carries GST_TOF_FLAG_REFERENCE: qtitofdepth unwrap decides from it per pixel whether a
+ * near reading is r or r + R. The range property keeps the requested mode; its read-back from the driver shows far
+ * during a reference.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -80,6 +86,7 @@ enum
   PROP_DEVICE_ID,
   PROP_NUM_V4L2_BUFFERS,
   PROP_SETTLE_TIME,
+  PROP_FAR_REFERENCE_INTERVAL,
   PROP_STATS,
 };
 
@@ -106,6 +113,7 @@ struct _GstTofSrc
   gboolean frame_rate_set;
   guint n_v4l2_buffers;
   guint settle_ms;
+  guint far_ref_interval;       /* near groups between far references, 0 = off */
 
   /* device state (object lock for subdev_fd users outside the streaming thread) */
   gint video_fd;
@@ -146,6 +154,9 @@ struct _GstTofSrc
   guint64 n_seq_gaps;
   guint64 n_switch_dropped;
   guint64 n_switches;
+  guint ref_near_count;         /* near groups pushed since the last far reference */
+  gboolean in_reference;        /* far written for a reference, not pushed yet */
+  guint64 n_references;
 };
 
 G_DEFINE_TYPE (GstTofSrc, gst_tof_src, GST_TYPE_PUSH_SRC);
@@ -389,16 +400,25 @@ warn_ignored (GstTofSrc * self, const gchar * what)
 
 /* call with the object lock held */
 static void
-apply_range (GstTofSrc * self)
+apply_mode (GstTofSrc * self, GstTofRange mode)
 {
   guint64 t = monotonic_ns ();
 
-  if (write_ctrl (self, CID_TRIGGER_MODE, self->range, "trigger_mode")) {
+  if (write_ctrl (self, CID_TRIGGER_MODE, mode, "trigger_mode")) {
     self->drop_before_ts = t + self->settle_ms * GST_MSECOND;
     self->after_switch = TRUE;
     self->n_switches++;
-    self->applied_range = self->range;
+    self->applied_range = mode;
   }
+}
+
+/* call with the object lock held */
+static void
+apply_range (GstTofSrc * self)
+{
+  self->in_reference = FALSE;
+  self->ref_near_count = 0;
+  apply_mode (self, self->range);
 }
 
 static void
@@ -515,6 +535,7 @@ gst_tof_src_start (GstBaseSrc * basesrc)
   self->drop_left = STREAMON_DROP_GROUPS;
   self->after_switch = FALSE;
   self->n_switches = 0;
+  self->n_references = 0;
   if (self->exposure_set) {
     write_ctrl (self, V4L2_CID_EXPOSURE, self->exposure, "exposure");
     warn_ignored (self, "exposure");
@@ -842,6 +863,17 @@ gst_tof_src_create (GstPushSrc * pushsrc, GstBuffer ** out)
       }
       mode = self->applied_range;
       req = self->range;
+      if (!drop && self->in_reference && mode == GST_TOF_RANGE_FAR) {
+        /* the reference: back to the requested mode, also if the interval was set to 0 meanwhile */
+        flags |= GST_TOF_FLAG_REFERENCE;
+        self->n_references++;
+        apply_range (self);
+      } else if (!drop && self->far_ref_interval > 0 && self->range == GST_TOF_RANGE_NEAR &&
+          mode == GST_TOF_RANGE_NEAR && !self->in_reference &&
+          ++self->ref_near_count >= self->far_ref_interval) {
+        self->in_reference = TRUE;
+        apply_mode (self, GST_TOF_RANGE_FAR);
+      }
       GST_OBJECT_UNLOCK (self);
       if (drop) {
         discard_pending (self);
@@ -901,6 +933,8 @@ gst_tof_src_set_property (GObject * object, guint prop_id, const GValue * value,
       break;
     case PROP_RANGE:
       self->range = g_value_get_enum (value);
+      self->in_reference = FALSE;       /* a range write ends a pending far reference */
+      self->ref_near_count = 0;
       if (self->subdev_fd >= 0 && self->range != self->applied_range)
         apply_range (self);
       else if (self->subdev_fd < 0)
@@ -923,6 +957,9 @@ gst_tof_src_set_property (GObject * object, guint prop_id, const GValue * value,
       break;
     case PROP_SETTLE_TIME:
       self->settle_ms = g_value_get_uint (value);
+      break;
+    case PROP_FAR_REFERENCE_INTERVAL:
+      self->far_ref_interval = g_value_get_uint (value);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -980,6 +1017,9 @@ gst_tof_src_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_SETTLE_TIME:
       g_value_set_uint (value, self->settle_ms);
       break;
+    case PROP_FAR_REFERENCE_INTERVAL:
+      g_value_set_uint (value, self->far_ref_interval);
+      break;
     case PROP_STATS:
       g_value_take_boxed (value, gst_structure_new ("stats",
               "groups-pushed", G_TYPE_UINT64, self->n_pushed,
@@ -988,7 +1028,8 @@ gst_tof_src_get_property (GObject * object, guint prop_id, GValue * value,
               "sequence-gaps", G_TYPE_UINT64, self->n_seq_gaps,
               "groups-dropped-switch", G_TYPE_UINT64, self->n_switch_dropped,
               "groups-dropped-start", G_TYPE_UINT64, (guint64) (STREAMON_DROP_GROUPS - self->drop_left),
-              "range-switches", G_TYPE_UINT64, self->n_switches, NULL));
+              "range-switches", G_TYPE_UINT64, self->n_switches,
+              "far-references", G_TYPE_UINT64, self->n_references, NULL));
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -1069,10 +1110,15 @@ gst_tof_src_class_init (GstTofSrcClass * klass)
           "After a range change, drop groups whose first frame starts sooner than this "
           "(the module switches 40-50 ms after the write, RUN-0047)",
           0, 1000, DEFAULT_SETTLE_MS, rw | GST_PARAM_MUTABLE_PLAYING));
+  g_object_class_install_property (gobject_class, PROP_FAR_REFERENCE_INTERVAL,
+      g_param_spec_uint ("far-reference-interval", "Far reference interval",
+          "With range=near, take one far group after this many near groups, flagged as a reference for "
+          "qtitofdepth unwrap (each costs the far group and the groups dropped at two range writes, RUN-0105); "
+          "0 = off", 0, G_MAXUINT, 0, rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_STATS,
       g_param_spec_boxed ("stats", "Statistics",
           "groups-pushed, groups-incomplete, frames-stray, sequence-gaps, "
-          "groups-dropped-switch, range-switches", GST_TYPE_STRUCTURE, ro));
+          "groups-dropped-switch, range-switches, far-references", GST_TYPE_STRUCTURE, ro));
 
   gst_element_class_add_static_pad_template (element_class, &src_template);
   gst_element_class_set_static_metadata (element_class, "Arducam ToF source",

@@ -31,6 +31,7 @@ G_BEGIN_DECLS
 /* header flags */
 #define GST_TOF_FLAG_MODE_DETECTED   (1 << 0) /* mode measured from the data; else assumed */
 #define GST_TOF_FLAG_AFTER_SWITCH    (1 << 1) /* first group pushed after a range write */
+#define GST_TOF_FLAG_REFERENCE       (1 << 2) /* far group taken by far-reference-interval (RUN-0106) */
 
 /* header field offsets */
 #define GST_TOF_OFF_MAGIC      0

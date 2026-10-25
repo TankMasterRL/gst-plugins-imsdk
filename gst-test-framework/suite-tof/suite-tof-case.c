@@ -22,6 +22,13 @@
  *   thread-hint   cpu-affinity=1-2 util-clamp-min=300: the pushing thread gets them (read back from the kernel and in
  *                 the stats), a second pushing thread takes them over and the first gets its own back, teardown
  *                 restores; no hint = no change; an invalid CPU list stops the start (arducam-tof-ventuno RUN-0098)
+ *   unwrap        unwrap=true on synthetic groups (left/right halves at set distances): a near group before the first
+ *                 reference is unchanged, a far group (0.5 m | 2.5 m) is output as it is and becomes the reference, the
+ *                 next near group reads 0.5 m | 2.5 m, a half that moved 0.4 m is invalid, a half within the tolerance
+ *                 follows; unwrap=false leaves every group as computed; the stats count it (arducam-tof-ventuno RUN-0106)
+ *   far-reference live qtitofsrc range=near far-reference-interval=10 into qtitofdepth unwrap=true: runs of 10 near
+ *                 groups, each far group flagged reference + after-switch, two range writes per reference, 1-3 groups
+ *                 dropped per write, the depth element counts every far group as a reference (arducam-tof-ventuno RUN-0106)
  * The live cases need the Arducam ToF on CAMERA0 with the ToF boot entry and drivers loaded.
  */
 
@@ -54,6 +61,7 @@ static gint runningtime = 10;
 typedef struct
 {
   GArray *mode;                 /* guint8 */
+  GArray *flags;                /* guint16 */
   GArray *gseq;                 /* guint32 */
   GArray *pts;                  /* guint64 */
   guint bad_header;
@@ -77,6 +85,7 @@ record_probe (GstPad * pad, GstPadProbeInfo * info, gpointer data)
     rec->bad_header++;
   } else {
     guint8 mode = map.data[40];
+    guint16 flags = GST_READ_UINT16_LE (map.data + 6);
     guint32 gseq = GST_READ_UINT32_LE (map.data + 8);
     guint64 pts = GST_BUFFER_PTS (buf);
 
@@ -86,6 +95,7 @@ record_probe (GstPad * pad, GstPadProbeInfo * info, gpointer data)
         rec->bad_frame_seq++;
     rec->firmware = GST_READ_UINT32_LE (map.data + 42);
     g_array_append_val (rec->mode, mode);
+    g_array_append_val (rec->flags, flags);
     g_array_append_val (rec->gseq, gseq);
     g_array_append_val (rec->pts, pts);
   }
@@ -117,8 +127,8 @@ run_until_eos (GstElement * pipeline, guint timeout_s)
 }
 
 static void
-stream_and_record (const gchar * desc, guint groups, guint switch_at, TofRecord * rec,
-    GstStructure ** stats)
+stream_and_record_full (const gchar * desc, guint groups, guint switch_at, TofRecord * rec,
+    GstStructure ** stats, GstStructure ** depth_stats)
 {
   GError *err = NULL;
   GstElement *pipeline = gst_parse_launch (desc, &err);
@@ -127,6 +137,7 @@ stream_and_record (const gchar * desc, guint groups, guint switch_at, TofRecord 
   fail_unless (pipeline != NULL, "parse: %s", err ? err->message : "?");
   memset (rec, 0, sizeof (*rec));
   rec->mode = g_array_new (FALSE, FALSE, sizeof (guint8));
+  rec->flags = g_array_new (FALSE, FALSE, sizeof (guint16));
   rec->gseq = g_array_new (FALSE, FALSE, sizeof (guint32));
   rec->pts = g_array_new (FALSE, FALSE, sizeof (guint64));
   rec->src = gst_bin_get_by_name (GST_BIN (pipeline), "s");
@@ -138,15 +149,30 @@ stream_and_record (const gchar * desc, guint groups, guint switch_at, TofRecord 
 
   run_until_eos (pipeline, groups / 30 + 15);
   g_object_get (rec->src, "stats", stats, NULL);
+  if (depth_stats) {
+    GstElement *d = gst_bin_get_by_name (GST_BIN (pipeline), "d");
+
+    fail_unless (d != NULL);
+    g_object_get (d, "stats", depth_stats, NULL);
+    gst_object_unref (d);
+  }
   gst_element_set_state (pipeline, GST_STATE_NULL);
   gst_object_unref (rec->src);
   gst_object_unref (pipeline);
 }
 
 static void
+stream_and_record (const gchar * desc, guint groups, guint switch_at, TofRecord * rec,
+    GstStructure ** stats)
+{
+  stream_and_record_full (desc, groups, switch_at, rec, stats, NULL);
+}
+
+static void
 record_free (TofRecord * rec)
 {
   g_array_unref (rec->mode);
+  g_array_unref (rec->flags);
   g_array_unref (rec->gseq);
   g_array_unref (rec->pts);
 }
@@ -964,6 +990,155 @@ GST_START_TEST (test_tof_thread_hint)
 }
 GST_END_TEST;
 
+/* A group whose left half (x < 120) reads dl and right half dr (phi_ref 0, c0 0: phi = -2 pi d / R), amplitude 200 */
+static GstBuffer *
+group_at (guint8 mode, gdouble dl, gdouble dr)
+{
+  GstBuffer *buf = gst_buffer_new_allocate (NULL, TOF_SIZE, NULL);
+  gdouble r = mode ? 2.0 : 4.0;
+  GstMapInfo map;
+  gint16 *f;
+
+  gst_buffer_map (buf, &map, GST_MAP_WRITE);
+  memset (map.data, 0, TOF_HDR);
+  GST_WRITE_UINT32_LE (map.data, TOF_MAGIC);
+  GST_WRITE_UINT16_LE (map.data + 4, TOF_HDR);
+  map.data[40] = map.data[41] = mode;
+  f = (gint16 *) (map.data + TOF_HDR);
+  for (guint p = 0; p < TOF_PIX; p++) {
+    gdouble phi = -2.0 * G_PI * (p % TOF_W < TOF_W / 2 ? dl : dr) / r;
+    gint16 c = (gint16) lround (200.0 * cos (phi)), s = (gint16) lround (200.0 * sin (phi));
+
+    f[p] = GINT16_TO_LE (c);
+    f[TOF_PIX + p] = GINT16_TO_LE (s);
+    f[2 * TOF_PIX + p] = GINT16_TO_LE (-c);
+    f[3 * TOF_PIX + p] = GINT16_TO_LE (-s);
+  }
+  gst_buffer_unmap (buf, &map);
+  return buf;
+}
+
+/* push one group, check every pixel of each half of the GRAY16_LE depth against the expected mm (0 = invalid) */
+static void
+push_expect (GstHarness * h, GstBuffer * in, gint want_l, gint want_r, const gchar * what)
+{
+  GstBuffer *out;
+  GstMapInfo map;
+
+  fail_unless_equals_int (gst_harness_push (h, in), GST_FLOW_OK);
+  out = gst_harness_pull (h);
+  fail_unless (out != NULL, "%s: no output", what);
+  gst_buffer_map (out, &map, GST_MAP_READ);
+  fail_unless (map.size >= TOF_PIX * 2);
+  for (guint p = 0; p < TOF_PIX; p++) {
+    gint got = GST_READ_UINT16_LE (map.data + 2 * p), want = p % TOF_W < TOF_W / 2 ? want_l : want_r;
+
+    fail_unless (want == 0 ? got == 0 : ABS (got - want) <= 3, "%s: pixel %u %d mm, expected %d", what, p, got, want);
+  }
+  gst_buffer_unmap (out, &map);
+  gst_buffer_unref (out);
+}
+
+static GstHarness *
+unwrap_harness (const gchar * cal, gboolean unwrap)
+{
+  gchar *launch = g_strdup_printf ("qtitofdepth calibration=\"%s\" unwrap=%s", cal, unwrap ? "true" : "false");
+  GstHarness *h = gst_harness_new_parse (launch);
+
+  g_free (launch);
+  gst_harness_set_src_caps_str (h, TOF_DCS_CAPS);
+  gst_harness_set_sink_caps_str (h,
+      "video/x-raw, format=(string)GRAY16_LE, width=(int)240, height=(int)180, framerate=(fraction)30/1");
+  return h;
+}
+
+GST_START_TEST (test_tof_unwrap)
+{
+  gchar *cal = write_tmp ("[calibration]\nformat=2\n"
+      "[far]\nR=4.0\nphi_ref=0\nc0=0\n[near]\nR=2.0\nphi_ref=0\nc0=0\n");
+  GstHarness *h = unwrap_harness (cal, TRUE);
+  GstElement *el = gst_harness_find_element (h, "qtitofdepth");
+  GstStructure *stats;
+  guint64 refs = 0, unw = 0, und = 0;
+  const guint64 half = TOF_PIX / 2;
+
+  push_expect (h, group_at (1, 0.5, 0.5), 500, 500, "near before the first reference");
+  push_expect (h, group_at (0, 0.5, 2.5), 500, 2500, "far reference");
+  push_expect (h, group_at (1, 0.5, 0.5), 500, 2500, "near after the reference");
+  push_expect (h, group_at (1, 0.5, 0.9), 500, 0, "right half moved 0.4 m");
+  push_expect (h, group_at (1, 0.55, 0.5), 550, 2500, "left half within the tolerance, right back");
+  g_object_get (el, "stats", &stats, NULL);
+  fail_unless (gst_structure_get_uint64 (stats, "unwrap-references", &refs));
+  fail_unless (gst_structure_get_uint64 (stats, "unwrapped", &unw));
+  fail_unless (gst_structure_get_uint64 (stats, "unwrap-undecided", &und));
+  fail_unless_equals_uint64 (refs, 1);
+  fail_unless_equals_uint64 (unw, 2 * half);
+  fail_unless_equals_uint64 (und, half);
+  gst_structure_free (stats);
+  gst_object_unref (el);
+  gst_harness_teardown (h);
+
+  /* off: every group as computed */
+  h = unwrap_harness (cal, FALSE);
+  push_expect (h, group_at (1, 0.5, 0.5), 500, 500, "off: near");
+  push_expect (h, group_at (0, 0.5, 2.5), 500, 2500, "off: far");
+  push_expect (h, group_at (1, 0.5, 0.5), 500, 500, "off: near after a far group");
+  push_expect (h, group_at (1, 0.5, 0.9), 500, 900, "off: moved half");
+  gst_harness_teardown (h);
+  g_unlink (cal);
+  g_free (cal);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_tof_far_reference)
+{
+  TofRecord rec;
+  GstStructure *stats = NULL, *dstats = NULL;
+  guint64 refs = 0, switches = 0, dropped = 0, drefs = 0;
+  guint n_far = 0, run = 0, runs_bad = 0, flags_bad = 0, first_far = G_MAXUINT;
+
+  stream_and_record_full ("qtitofsrc name=s range=near far-reference-interval=10 num-buffers=166 ! "
+      "qtitofdepth name=d unwrap=true ! fakesink sync=false", 166, 0, &rec, &stats, &dstats);
+  fail_unless_equals_int (rec.bad_header, 0);
+  for (guint i = 0; i < rec.mode->len; i++) {
+    guint8 m = g_array_index (rec.mode, guint8, i);
+    guint16 fl = g_array_index (rec.flags, guint16, i);
+
+    if (m == 0) {
+      /* (1 << 1) after-switch, (1 << 2) reference */
+      if ((fl & 0x6) != 0x6)
+        flags_bad++;
+      if (run != 10)
+        runs_bad++;
+      if (first_far == G_MAXUINT)
+        first_far = i;
+      n_far++;
+      run = 0;
+    } else {
+      if (fl & 0x4)
+        flags_bad++;
+      run++;
+    }
+  }
+  fail_unless (first_far == 10, "first far group at %u", first_far);
+  fail_unless_equals_int (runs_bad, 0);
+  fail_unless_equals_int (flags_bad, 0);
+  fail_unless_equals_int (n_far, 15);
+  fail_unless (gst_structure_get_uint64 (stats, "far-references", &refs));
+  fail_unless (gst_structure_get_uint64 (stats, "range-switches", &switches));
+  fail_unless (gst_structure_get_uint64 (stats, "groups-dropped-switch", &dropped));
+  fail_unless (gst_structure_get_uint64 (dstats, "unwrap-references", &drefs));
+  fail_unless_equals_uint64 (refs, n_far);
+  fail_unless_equals_uint64 (switches, 2 * (guint64) n_far);
+  fail_unless (dropped >= switches && dropped <= 3 * switches, "dropped %" G_GUINT64_FORMAT " for %"
+      G_GUINT64_FORMAT " writes", dropped, switches);
+  fail_unless_equals_uint64 (drefs, n_far);
+  gst_structure_free (stats);
+  gst_structure_free (dstats);
+  record_free (&rec);
+}
+GST_END_TEST;
+
 static Suite *
 tof_suite (GList ** tcnames, gint iteration, gint duration)
 {
@@ -1023,6 +1198,12 @@ tof_suite (GList ** tcnames, gint iteration, gint duration)
   suite_add_tcase (s, tc);
   tcase_add_loop_test (tc, test_tof_thread_hint, start, end);
 
+  tcname = "unwrap";
+  tc = tcase_create (tcname);
+  *tcnames = g_list_append (*tcnames, (gpointer) tcname);
+  suite_add_tcase (s, tc);
+  tcase_add_loop_test (tc, test_tof_unwrap, start, end);
+
   tcname = "stream";
   tc = tcase_create (tcname);
   *tcnames = g_list_append (*tcnames, (gpointer) tcname);
@@ -1036,6 +1217,13 @@ tof_suite (GList ** tcnames, gint iteration, gint duration)
   suite_add_tcase (s, tc);
   tcase_set_timeout (tc, 40);
   tcase_add_loop_test (tc, test_tof_range_switch, start, end);
+
+  tcname = "far-reference";
+  tc = tcase_create (tcname);
+  *tcnames = g_list_append (*tcnames, (gpointer) tcname);
+  suite_add_tcase (s, tc);
+  tcase_set_timeout (tc, 40);
+  tcase_add_loop_test (tc, test_tof_far_reference, start, end);
 
   return s;
 }

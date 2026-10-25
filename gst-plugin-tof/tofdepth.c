@@ -22,6 +22,14 @@
  * group, the reference target's amplitude x m^2); a valid pixel whose amplitude is not above that bound plus
  * 3 wrap_sigma / sqrt (groups averaged) could be wrapped and becomes invalid, before the flying-pixel pass.
  *
+ * unwrap (arducam-tof-ventuno RUN-0105/RUN-0106): near mode reads a surface at d >= R_near as d - R_near. Every far group
+ * (qtitofsrc far-reference-interval) is a reference: per pixel k = argmin |r_B + k R_near - r_F|, k in {0, 1}, with r_B
+ * the latest valid near reading since the previous reference; D = r_B + k R_near if that residual <= unwrap-delta, else
+ * the previous D stays. After the first reference a valid near pixel with a D is output at r + k' R_near when
+ * |r + k' R_near - D| <= unwrap-tolerance (k' the argmin), else it becomes invalid. Far groups are output unchanged, near
+ * groups before the first reference too; on the measured distances, before the other passes; once a reference exists
+ * the wrap test is not applied to near groups (unwrap supersedes it). One loop for both paths (no NEON variant).
+ *
  * cpu-affinity / util-clamp-min (arducam-tof-ventuno RUN-0098): a scheduling hint for the streaming thread that calls the
  * chain function (without a queue in front, qtitofsrc's), instead of taskset on the whole process. Applied with
  * sched_setaffinity / sched_setattr (SCHED_FLAG_UTIL_CLAMP_MIN, unprivileged) when the first group arrives on a thread; that
@@ -84,6 +92,8 @@ GST_DEBUG_CATEGORY_STATIC (gst_tof_depth_debug);
 #define DEFAULT_FLYING_PIXEL_THRESHOLD 0.0
 #define DEFAULT_WRAP_REFLECTIVITY 0.0
 #define WRAP_NOISE_Z             3.0     /* noise allowance in sigma (RUN-0090) */
+#define DEFAULT_UNWRAP_DELTA     0.5     /* m: R_near / 4 (RUN-0105) */
+#define DEFAULT_UNWRAP_TOLERANCE 0.15    /* m: 0.075 R_near (RUN-0105) */
 #define DEFAULT_PROCESSING_LATENCY -1
 #define DEFAULT_UTIL_CLAMP_MIN   -1
 /* automatic processing latency: live p99 after the source push, NEON build, unpinned (arducam-tof-ventuno
@@ -140,6 +150,9 @@ enum
   PROP_PROCESSING_LATENCY,
   PROP_CPU_AFFINITY,
   PROP_UTIL_CLAMP_MIN,
+  PROP_UNWRAP,
+  PROP_UNWRAP_DELTA,
+  PROP_UNWRAP_TOLERANCE,
   PROP_STATS,
 };
 
@@ -208,6 +221,9 @@ struct _GstTofDepth
   gint64 processing_latency;    /* ns, -1 = automatic */
   gchar *cpu_affinity;          /* CPU list for the streaming thread, NULL or "" = leave it alone */
   gint util_clamp_min;          /* uclamp.min for the streaming thread, -1 = leave it alone */
+  gboolean unwrap;              /* far groups as references for near groups */
+  gdouble unwrap_delta;         /* m, reference residual limit */
+  gdouble unwrap_tolerance;     /* m, carry residual limit */
 
   /* thread hint: set at READY -> PAUSED, applied by the streaming thread, undone at PAUSED -> READY */
   gboolean hint_cpus;           /* hint_set is to be applied */
@@ -238,12 +254,19 @@ struct _GstTofDepth
   guint hist_count, hist_pos, hist_n;
   gint hist_mode;
   guint avg_count;              /* groups averaged into the current one */
+  gfloat *uw_ref;               /* unwrap: reference distance D per pixel (m), 0 = none */
+  gfloat *uw_last;              /* unwrap: latest valid near reading since the previous reference, 0 = none */
+  gboolean uw_seen;             /* unwrap: a near group was seen */
+  gboolean uw_have;             /* unwrap: a reference was taken */
 
   /* stats (object lock) */
   guint64 n_groups;
   guint64 proc_ns;
   guint64 n_flying;
   guint64 n_wrap;
+  guint64 n_uw_refs;
+  guint64 n_unwrapped;
+  guint64 n_undecided;
 };
 
 #define gst_tof_depth_parent_class parent_class
@@ -811,6 +834,103 @@ remove_wrapped (GstTofDepth * self, const TofModel * m, gfloat rho)
   return n;
 }
 
+static void
+unwrap_reset (GstTofDepth * self)
+{
+  memset (self->uw_ref, 0, N_PIX * sizeof (gfloat));
+  memset (self->uw_last, 0, N_PIX * sizeof (gfloat));
+  self->uw_seen = self->uw_have = FALSE;
+}
+
+/* Unwrap (see the top of the file): a far group updates the references, a near group after the first reference is
+ * extended by k' R_near or set invalid. The NEON path does the same float operations in the same order, 4 pixels per
+ * step (bit-identical; the scalar loop costs +0.6 ms per group on the in-order A55, RUN-0106). Returns TRUE if the
+ * group was unwrapped; counts the pixels given + R_near and those removed. */
+static gboolean
+unwrap_group (GstTofDepth * self, guint mode, gfloat delta, gfloat tol, guint * n_unw, guint * n_und)
+{
+  const gfloat rn = (gfloat) self->models[GST_TOF_RANGE_NEAR].r;
+  gfloat *dist = self->dist, *ref = self->uw_ref, *last = self->uw_last;
+  guint unw = 0, und = 0;
+
+  if (mode == GST_TOF_RANGE_FAR) {
+    if (!self->uw_seen)
+      return FALSE;
+#ifdef TOF_HAVE_NEON
+    if (use_simd) {
+      const float32x4_t vrn = vdupq_n_f32 (rn), vdelta = vdupq_n_f32 (delta), zero = vdupq_n_f32 (0.0f);
+
+      for (guint p = 0; p < N_PIX; p += 4) {
+        float32x4_t b = vld1q_f32 (last + p), f = vld1q_f32 (dist + p), br = vaddq_f32 (b, vrn);
+        float32x4_t e0 = vabsq_f32 (vsubq_f32 (b, f)), e1 = vabsq_f32 (vsubq_f32 (br, f));
+        uint32x4_t ok = vandq_u32 (vandq_u32 (vcgtq_f32 (b, zero), vcgtq_f32 (f, zero)),
+            vcleq_f32 (vminq_f32 (e0, e1), vdelta));
+
+        vst1q_f32 (ref + p, vbslq_f32 (ok, vbslq_f32 (vcltq_f32 (e1, e0), br, b), vld1q_f32 (ref + p)));
+        vst1q_f32 (last + p, zero);
+      }
+      goto far_done;
+    }
+#endif
+    for (guint p = 0; p < N_PIX; p++) {
+      gfloat b = last[p], f = dist[p], br = b + rn;
+      gfloat e0 = fabsf (b - f), e1 = fabsf (br - f);
+      gboolean k = e1 < e0, ok = (b > 0.0f) & (f > 0.0f) & (MIN (e0, e1) <= delta);
+
+      ref[p] = ok ? (k ? br : b) : ref[p];
+      last[p] = 0.0f;
+    }
+#ifdef TOF_HAVE_NEON
+  far_done:
+#endif
+    self->uw_have = TRUE;
+    GST_OBJECT_LOCK (self);
+    self->n_uw_refs++;
+    GST_OBJECT_UNLOCK (self);
+    return FALSE;
+  }
+  self->uw_seen = TRUE;
+  if (!self->uw_have) {
+    for (guint p = 0; p < N_PIX; p++)
+      last[p] = dist[p] > 0.0f ? dist[p] : last[p];
+    return FALSE;
+  }
+#ifdef TOF_HAVE_NEON
+  if (use_simd) {
+    const float32x4_t vrn = vdupq_n_f32 (rn), vtol = vdupq_n_f32 (tol), zero = vdupq_n_f32 (0.0f);
+    uint32x4_t cu = vdupq_n_u32 (0), cd = vdupq_n_u32 (0);
+
+    for (guint p = 0; p < N_PIX; p += 4) {
+      float32x4_t d = vld1q_f32 (dist + p), D = vld1q_f32 (ref + p), dr = vaddq_f32 (d, vrn);
+      float32x4_t e0 = vabsq_f32 (vsubq_f32 (d, D)), e1 = vabsq_f32 (vsubq_f32 (dr, D));
+      uint32x4_t valid = vcgtq_f32 (d, zero), k = vcltq_f32 (e1, e0);
+      uint32x4_t dec = vandq_u32 (vandq_u32 (valid, vcgtq_f32 (D, zero)), vcleq_f32 (vminq_f32 (e0, e1), vtol));
+
+      vst1q_f32 (dist + p, vbslq_f32 (dec, vbslq_f32 (k, dr, d), zero));
+      vst1q_f32 (last + p, vbslq_f32 (valid, d, vld1q_f32 (last + p)));
+      cu = vsubq_u32 (cu, vandq_u32 (dec, k));          /* a set lane is all ones = -1 */
+      cd = vsubq_u32 (cd, vbicq_u32 (valid, dec));
+    }
+    *n_unw = vaddvq_u32 (cu);
+    *n_und = vaddvq_u32 (cd);
+    return TRUE;
+  }
+#endif
+  for (guint p = 0; p < N_PIX; p++) {
+    gfloat d = dist[p], D = ref[p], dr = d + rn;
+    gfloat e0 = fabsf (d - D), e1 = fabsf (dr - D);
+    gboolean valid = d > 0.0f, k = e1 < e0, dec = valid & (D > 0.0f) & (MIN (e0, e1) <= tol);
+
+    dist[p] = dec ? (k ? dr : d) : 0.0f;
+    last[p] = valid ? d : last[p];
+    unw += dec & k;
+    und += valid & !dec;
+  }
+  *n_unw = unw;
+  *n_und = und;
+  return TRUE;
+}
+
 /* Flying pixels: on a depth edge a pixel sees foreground and background, and its mixed phasor gives a depth in
  * between. A valid pixel whose depth lies strictly between both valid neighbours along a row, column or
  * diagonal, with jumps above the threshold on both sides, becomes invalid; a true edge pixel has a similar
@@ -859,7 +979,8 @@ fill_depth (GstTofDepth * self, GstVideoFrame * vf, guint mode)
 
   GST_OBJECT_LOCK (self);
   lo = (gfloat) self->min_distance;
-  hi = self->max_distance > 0.0 ? (gfloat) self->max_distance : (gfloat) self->models[mode].r;
+  hi = self->max_distance > 0.0 ? (gfloat) self->max_distance :
+      (gfloat) self->models[self->unwrap ? GST_TOF_RANGE_FAR : mode].r;
   cmap = self->colormap;
   GST_OBJECT_UNLOCK (self);
   span = hi > lo ? hi - lo : 1.0f;
@@ -1009,7 +1130,8 @@ fill_depth_neon (GstTofDepth * self, GstVideoFrame * vf, guint mode)
 
   GST_OBJECT_LOCK (self);
   lo = (gfloat) self->min_distance;
-  hi = self->max_distance > 0.0 ? (gfloat) self->max_distance : (gfloat) self->models[mode].r;
+  hi = self->max_distance > 0.0 ? (gfloat) self->max_distance :
+      (gfloat) self->models[self->unwrap ? GST_TOF_RANGE_FAR : mode].r;
   cmap = self->colormap;
   GST_OBJECT_UNLOCK (self);
   span = hi > lo ? hi - lo : 1.0f;
@@ -1510,9 +1632,9 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   GstFlowReturn ret = GST_FLOW_OK;
   GstMapInfo map;
   gboolean active[N_OUT];
-  guint mode, flying = 0, wrapped = 0;
-  gfloat flying_thr, wrap_rho;
-  gboolean to_z;
+  guint mode, flying = 0, wrapped = 0, unwrapped = 0, undecided = 0;
+  gfloat flying_thr, wrap_rho, uw_delta, uw_tol;
+  gboolean to_z, unwrap, unwrapped_group = FALSE;
   guint64 t0 = g_get_monotonic_time ();
 
   if (self->hint_cpus || self->hint_util_min >= 0)
@@ -1538,6 +1660,9 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   flying_thr = (gfloat) self->flying_pixel_threshold;
   wrap_rho = (gfloat) self->wrap_reflectivity;
   to_z = self->depth_type == GST_TOF_DEPTH_Z && self->zscale;
+  unwrap = self->unwrap;
+  uw_delta = (gfloat) self->unwrap_delta;
+  uw_tol = (gfloat) self->unwrap_tolerance;
   GST_OBJECT_UNLOCK (self);
 
   if (active[OUT_POINTCLOUD] && !self->zscale) {
@@ -1557,7 +1682,10 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   }
   compute (self, map.data, active[OUT_DEPTH] || active[OUT_CONFIDENCE] || active[OUT_POINTCLOUD]);
   gst_buffer_unmap (inbuf, &map);
-  if (wrap_rho > 0.0f && (active[OUT_DEPTH] || active[OUT_CONFIDENCE] || active[OUT_POINTCLOUD]))
+  if (unwrap && (active[OUT_DEPTH] || active[OUT_CONFIDENCE] || active[OUT_POINTCLOUD]))
+    unwrapped_group = unwrap_group (self, mode, uw_delta, uw_tol, &unwrapped, &undecided);
+  if (wrap_rho > 0.0f && !unwrapped_group &&
+      (active[OUT_DEPTH] || active[OUT_CONFIDENCE] || active[OUT_POINTCLOUD]))
     wrapped = remove_wrapped (self, &self->models[mode], wrap_rho);
   if (flying_thr > 0.0f && (active[OUT_DEPTH] || active[OUT_CONFIDENCE] || active[OUT_POINTCLOUD]))
     flying = remove_flying_pixels (self, flying_thr);
@@ -1584,6 +1712,8 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   self->n_groups++;
   self->n_flying += flying;
   self->n_wrap += wrapped;
+  self->n_unwrapped += unwrapped;
+  self->n_undecided += undecided;
   self->proc_ns += (g_get_monotonic_time () - t0) * 1000;
   GST_OBJECT_UNLOCK (self);
   gst_buffer_unref (inbuf);
@@ -1653,6 +1783,7 @@ gst_tof_depth_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
     case GST_EVENT_FLUSH_STOP:
       gst_flow_combiner_reset (self->combiner);
       self->hist_count = self->hist_pos = 0;
+      unwrap_reset (self);
       if (self->sum_i) {
         memset (self->sum_i, 0, N_PIX * sizeof (gfloat));
         memset (self->sum_q, 0, N_PIX * sizeof (gfloat));
@@ -1809,6 +1940,7 @@ gst_tof_depth_change_state (GstElement * element, GstStateChange transition)
     gst_flow_combiner_reset (self->combiner);
     self->hist_count = self->hist_pos = 0;
     g_clear_pointer (&self->hist, g_free);
+    unwrap_reset (self);
   }
   ret = GST_ELEMENT_CLASS (parent_class)->change_state (element, transition);
   if (transition == GST_STATE_CHANGE_PAUSED_TO_READY) {
@@ -1865,6 +1997,15 @@ gst_tof_depth_set_property (GObject * object, guint prop_id, const GValue * valu
       break;
     case PROP_FLYING_PIXEL_THRESHOLD:
       self->flying_pixel_threshold = g_value_get_double (value);
+      break;
+    case PROP_UNWRAP:
+      self->unwrap = g_value_get_boolean (value);
+      break;
+    case PROP_UNWRAP_DELTA:
+      self->unwrap_delta = g_value_get_double (value);
+      break;
+    case PROP_UNWRAP_TOLERANCE:
+      self->unwrap_tolerance = g_value_get_double (value);
       break;
     case PROP_WRAP_REFLECTIVITY:
       self->wrap_reflectivity = g_value_get_double (value);
@@ -1950,6 +2091,15 @@ gst_tof_depth_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_UTIL_CLAMP_MIN:
       g_value_set_int (value, self->util_clamp_min);
       break;
+    case PROP_UNWRAP:
+      g_value_set_boolean (value, self->unwrap);
+      break;
+    case PROP_UNWRAP_DELTA:
+      g_value_set_double (value, self->unwrap_delta);
+      break;
+    case PROP_UNWRAP_TOLERANCE:
+      g_value_set_double (value, self->unwrap_tolerance);
+      break;
     case PROP_STATS:
       g_value_take_boxed (value, gst_structure_new ("stats",
               "groups", G_TYPE_UINT64, self->n_groups,
@@ -1958,6 +2108,9 @@ gst_tof_depth_get_property (GObject * object, guint prop_id, GValue * value,
               "lens", G_TYPE_STRING, self->lens_used ? self->lens_used : "",
               "flying-pixels", G_TYPE_UINT64, self->n_flying,
               "wrap-flagged", G_TYPE_UINT64, self->n_wrap,
+              "unwrap-references", G_TYPE_UINT64, self->n_uw_refs,
+              "unwrapped", G_TYPE_UINT64, self->n_unwrapped,
+              "unwrap-undecided", G_TYPE_UINT64, self->n_undecided,
               "mean-process-us", G_TYPE_DOUBLE,
               self->n_groups ? self->proc_ns / 1000.0 / self->n_groups : 0.0,
               "thread-cpus", G_TYPE_STRING, self->thread_cpus ? self->thread_cpus : "",
@@ -1990,6 +2143,8 @@ gst_tof_depth_finalize (GObject * object)
   g_free (self->sum_q);
   g_free (self->hist);
   g_free (self->flying);
+  g_free (self->uw_ref);
+  g_free (self->uw_last);
   gst_clear_event (&self->stream_start);
   gst_flow_combiner_free (self->combiner);
   G_OBJECT_CLASS (parent_class)->finalize (object);
@@ -2051,6 +2206,19 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
           "a target this bright, relative to the calibration's wrap reference (wrap_k, wrap_sigma of each mode), "
           "could give from there; 2 = the measured setting (RUN-0090), 0 = off", 0.0, 100.0,
           DEFAULT_WRAP_REFLECTIVITY, rw | GST_PARAM_MUTABLE_PLAYING));
+  g_object_class_install_property (gobject_class, PROP_UNWRAP,
+      g_param_spec_boolean ("unwrap", "Unwrap near mode",
+          "Use every far group as a reference (qtitofsrc far-reference-interval) and output near-mode pixels beyond "
+          "the near range at r + R_near; pixels whose reading no longer fits their reference become invalid until "
+          "the next one (RUN-0105). Far groups are output as they are", FALSE, rw | GST_PARAM_MUTABLE_PLAYING));
+  g_object_class_install_property (gobject_class, PROP_UNWRAP_DELTA,
+      g_param_spec_double ("unwrap-delta", "Unwrap reference limit",
+          "Largest |r_near + k R_near - r_far| (m) for which a far group sets a pixel's reference", 0.01, 2.0,
+          DEFAULT_UNWRAP_DELTA, rw | GST_PARAM_MUTABLE_PLAYING));
+  g_object_class_install_property (gobject_class, PROP_UNWRAP_TOLERANCE,
+      g_param_spec_double ("unwrap-tolerance", "Unwrap tolerance",
+          "Largest |r + k R_near - reference| (m) for which a near pixel is output; above it the pixel moved and is "
+          "invalid until the next reference", 0.01, 1.0, DEFAULT_UNWRAP_TOLERANCE, rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_DEPTH_TYPE,
       g_param_spec_enum ("depth-type", "Depth type", "Distance definition of the depth output: radial "
           "(along each pixel's ray, as calibrated) or z (along the optical axis, needs a lens model)",
@@ -2079,7 +2247,8 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
           DEFAULT_UTIL_CLAMP_MIN, rw | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_STATS,
       g_param_spec_boxed ("stats", "Statistics", "groups, calibration (file in use, \"\" = none), depth-type, lens (file in use, \"\" = none), "
-          "flying-pixels (removed in all), wrap-flagged (removed in all), mean-process-us, thread-cpus and "
+          "flying-pixels (removed in all), wrap-flagged (removed in all), unwrap-references (far groups used), unwrapped "
+          "(pixels output beyond R_near), unwrap-undecided (valid near pixels removed), mean-process-us, thread-cpus and "
           "thread-util-clamp-min (the streaming thread's, read back after applying a hint; \"\" / -1 = no hint)",
           GST_TYPE_STRUCTURE, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
 
@@ -2135,6 +2304,8 @@ gst_tof_depth_init (GstTofDepth * self)
   self->temporal_average = DEFAULT_TEMPORAL_AVERAGE;
   self->flying_pixel_threshold = DEFAULT_FLYING_PIXEL_THRESHOLD;
   self->wrap_reflectivity = DEFAULT_WRAP_REFLECTIVITY;
+  self->unwrap_delta = DEFAULT_UNWRAP_DELTA;
+  self->unwrap_tolerance = DEFAULT_UNWRAP_TOLERANCE;
   self->depth_type = GST_TOF_DEPTH_RADIAL;
   self->processing_latency = DEFAULT_PROCESSING_LATENCY;
   self->util_clamp_min = DEFAULT_UTIL_CLAMP_MIN;
@@ -2147,6 +2318,8 @@ gst_tof_depth_init (GstTofDepth * self)
   self->sum_i = g_new0 (gfloat, N_PIX);
   self->sum_q = g_new0 (gfloat, N_PIX);
   self->flying = g_new0 (guint8, N_PIX);
+  self->uw_ref = g_new0 (gfloat, N_PIX);
+  self->uw_last = g_new0 (gfloat, N_PIX);
   build_turbo (self->turbo);
   gst_segment_init (&self->segment, GST_FORMAT_TIME);
   self->combiner = gst_flow_combiner_new ();
