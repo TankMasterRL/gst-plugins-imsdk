@@ -623,13 +623,30 @@ build_turbo (guint8 lut[256][3])
 
 /* ---------------------------------------------------------------- computation */
 
-#ifdef TOF_HAVE_NEON
 /* atan (t), t in [0, 1] = t (1 + c2 t^2 + ... + c16 t^16): Abramowitz & Stegun 4.4.49, |error| <= 2e-8 rad,
  * i.e. < 0.1 um of depth at R = 4 m; the float rounding (~1e-7 rad) dominates */
 static const gfloat atan_c[8] = { -0.3333314528f, 0.1999355085f, -0.1420889944f, 0.1065626393f,
   -0.0752896400f, 0.0429096138f, -0.0161657367f, 0.0028662257f
 };
 
+/* atan2_f32x4 () for one pixel: the same polynomial, operations and order (fmaf where it fuses), so the scalar loop
+ * of compute () is bit-identical to the NEON path. libm atan2f differs from the polynomial by an ulp in about a third
+ * of the pixels, which moved 91 of 68.7 M depth values by 1 mm (arducam-tof-ventuno RUN-0106, RUN-0108). */
+static inline gfloat
+atan2_poly (gfloat y, gfloat x)
+{
+  gfloat ax = fabsf (x), ay = fabsf (y), mx = MAX (ax, ay), mn = MIN (ax, ay);
+  gfloat t = mn / (mx == 0.0f ? 1.0f : mx), z = t * t, p = atan_c[7], r;
+
+  for (gint k = 6; k >= 0; k--)
+    p = fmaf (p, z, atan_c[k]);
+  r = t * fmaf (p, z, 1.0f);
+  r = ay > ax ? (gfloat) G_PI_2 - r : r;
+  r = x < 0.0f ? (gfloat) G_PI - r : r;
+  return y < 0.0f ? -r : r;
+}
+
+#ifdef TOF_HAVE_NEON
 static inline float32x4_t
 atan2_f32x4 (float32x4_t y, float32x4_t x)
 {
@@ -648,7 +665,7 @@ atan2_f32x4 (float32x4_t y, float32x4_t x)
   return vbslq_f32 (vcltq_f32 (y, zero), vnegq_f32 (r), r);
 }
 
-/* the per-pixel loop of compute (), 4 pixels per step; same operations and order as the scalar loop */
+/* the per-pixel loop of compute (), 4 pixels per step; same operations and order as the scalar loop, bit-identical (RUN-0108) */
 static void
 compute_neon (GstTofDepth * self, const gint16 * f0, const gint16 * f1, const gint16 * f2,
     const gint16 * f3, const TofModel * m, gfloat min_amp, guint navg, gboolean want_depth)
@@ -771,21 +788,22 @@ compute (GstTofDepth * self, const guint8 * data, gboolean want_depth)
       i = (gfloat) (s0 - s2);
       q = (gfloat) (s1 - s3);
     }
-    a = sqrtf (i * i + q * q) * 0.5f;
+    /* the fused steps are written as fmaf, as vfmaq/vfmsq in compute_neon (), not left to fp contraction */
+    a = sqrtf (fmaf (q, q, i * i)) * 0.5f;
     self->amp[p] = a;
     if (rail || a < min_amp) {
       self->dist[p] = 0.0f;
       continue;
     }
     if (want_depth) {
-      gfloat u = ref - atan2f (q, i), x, d;
+      gfloat u = ref - atan2_poly (q, i), x, d;
       guint k;
 
-      u -= (gfloat) TWO_PI * floorf (u / (gfloat) TWO_PI);
+      u = fmaf (-(gfloat) TWO_PI, floorf (u / (gfloat) TWO_PI), u);
       x = u * (LUT_SIZE / (gfloat) TWO_PI);
       k = MIN ((guint) x, LUT_SIZE - 1);
-      d = m->lut[k] + (x - k) * (m->lut[k + 1] - m->lut[k]);
-      d -= r * floorf (d / r);
+      d = fmaf (x - k, m->lut[k + 1] - m->lut[k], m->lut[k]);
+      d = fmaf (-r, floorf (d / r), d);
       self->dist[p] = d > 0.0f ? d : 1e-4f;
     } else {
       self->dist[p] = 1.0f;     /* valid marker only */
