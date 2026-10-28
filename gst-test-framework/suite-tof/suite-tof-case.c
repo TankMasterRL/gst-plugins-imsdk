@@ -26,6 +26,10 @@
  *                 reference is unchanged, a far group (0.5 m | 2.5 m) is output as it is and becomes the reference, the
  *                 next near group reads 0.5 m | 2.5 m, a half that moved 0.4 m is invalid, a half within the tolerance
  *                 follows; unwrap=false leaves every group as computed; the stats count it (arducam-tof-ventuno RUN-0106)
+ *   references    temporal-average=2 on synthetic groups with PTS: a group flagged reference is output unaveraged and the
+ *                 near window goes on across it, an unflagged far group restarts it; output-references=false: the
+ *                 reference reaches no output (depth, amplitude), a GAP event at its PTS takes its place on each, unwrap
+ *                 still uses it and the stats count it; by default it is output (arducam-tof-ventuno RUN-0110)
  *   far-reference live qtitofsrc range=near far-reference-interval=10 into qtitofdepth unwrap=true: runs of 10 near
  *                 groups, each far group flagged reference + after-switch, two range writes per reference, 1-3 groups
  *                 dropped per write, the depth element counts every far group as a reference (arducam-tof-ventuno RUN-0106)
@@ -1139,6 +1143,129 @@ GST_START_TEST (test_tof_far_reference)
 }
 GST_END_TEST;
 
+/* references (RUN-0110): buffers and GAP events seen on an output */
+typedef struct
+{
+  guint buffers;
+  guint gaps;
+  GstClockTime gap_ts;
+} RefCount;
+
+static GstPadProbeReturn
+ref_count_probe (GstPad * pad, GstPadProbeInfo * info, gpointer data)
+{
+  RefCount *c = data;
+
+  if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER) {
+    c->buffers++;
+  } else if (GST_EVENT_TYPE (GST_PAD_PROBE_INFO_EVENT (info)) == GST_EVENT_GAP) {
+    gst_event_parse_gap (GST_PAD_PROBE_INFO_EVENT (info), &c->gap_ts, NULL);
+    c->gaps++;
+  }
+  return GST_PAD_PROBE_OK;
+}
+
+/* group n of a 30/s stream; reference = the header flag qtitofsrc far-reference-interval sets */
+static GstBuffer *
+timed (GstBuffer * buf, guint n, gboolean reference)
+{
+  GST_BUFFER_PTS (buf) = n * GST_SECOND / 30;
+  GST_BUFFER_DURATION (buf) = GST_SECOND / 30;
+  if (reference) {
+    GstMapInfo map;
+
+    gst_buffer_map (buf, &map, GST_MAP_WRITE);
+    GST_WRITE_UINT16_LE (map.data + 6, 1 << 2);
+    gst_buffer_unmap (buf, &map);
+  }
+  return buf;
+}
+
+static GstHarness *
+props_harness (const gchar * cal, const gchar * props)
+{
+  gchar *launch = g_strdup_printf ("qtitofdepth calibration=\"%s\" %s", cal, props);
+  GstHarness *h = gst_harness_new_parse (launch);
+
+  g_free (launch);
+  gst_harness_set_src_caps_str (h, TOF_DCS_CAPS);
+  gst_harness_set_sink_caps_str (h,
+      "video/x-raw, format=(string)GRAY16_LE, width=(int)240, height=(int)180, framerate=(fraction)30/1");
+  return h;
+}
+
+GST_START_TEST (test_tof_references)
+{
+  gchar *cal = write_tmp ("[calibration]\nformat=2\n"
+      "[far]\nR=4.0\nphi_ref=0\nc0=0\n[near]\nR=2.0\nphi_ref=0\nc0=0\n");
+  GstHarness *h = props_harness (cal, "temporal-average=2");
+  GstElement *el, *sink;
+  GstPad *amp, *depth, *sinkpad;
+  GstStructure *stats;
+  RefCount cd = { 0 }, ca = { 0 };
+  guint64 groups = 0, refs = 0, dropped = 0;
+
+  /* averaging: equal amplitudes, so the mean of two phasors lies halfway */
+  push_expect (h, timed (group_at (1, 0.5, 0.5), 0, FALSE), 500, 500, "near 0.5 m");
+  push_expect (h, timed (group_at (1, 0.7, 0.7), 1, FALSE), 600, 600, "near 0.7 m, averaged with 0.5 m");
+  push_expect (h, timed (group_at (0, 0.5, 2.5), 2, TRUE), 500, 2500, "reference, not averaged");
+  push_expect (h, timed (group_at (1, 0.9, 0.9), 3, FALSE), 800, 800, "near 0.9 m, averaged with 0.7 m across it");
+  push_expect (h, timed (group_at (0, 0.5, 2.5), 4, FALSE), 500, 2500, "unflagged far group, window restarted");
+  push_expect (h, timed (group_at (1, 0.5, 0.5), 5, FALSE), 500, 500, "near after it, window restarted");
+  gst_harness_teardown (h);
+
+  /* output-references=false: the reference is used by unwrap but reaches no output, a GAP event instead */
+  h = props_harness (cal, "unwrap=true output-references=false");
+  el = gst_harness_find_element (h, "qtitofdepth");
+  amp = gst_element_request_pad_simple (el, "amplitude");
+  sink = gst_element_factory_make ("fakesink", NULL);
+  g_object_set (sink, "sync", FALSE, NULL);
+  sinkpad = gst_element_get_static_pad (sink, "sink");
+  fail_if (gst_element_set_state (sink, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE);
+  /* the harness keeps qtitofdepth in a bin of its own: link across the hierarchy */
+  fail_unless_equals_int (gst_pad_link_full (amp, sinkpad, GST_PAD_LINK_CHECK_NOTHING), GST_PAD_LINK_OK);
+  depth = gst_element_get_static_pad (el, "src");
+  gst_pad_add_probe (depth, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, ref_count_probe, &cd,
+      NULL);
+  gst_pad_add_probe (amp, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, ref_count_probe, &ca, NULL);
+  push_expect (h, timed (group_at (1, 0.5, 0.5), 0, FALSE), 500, 500, "near before the reference");
+  fail_unless_equals_int (gst_harness_push (h, timed (group_at (0, 0.5, 2.5), 1, TRUE)), GST_FLOW_OK);
+  fail_unless_equals_int (gst_harness_buffers_in_queue (h), 0);
+  push_expect (h, timed (group_at (1, 0.5, 0.5), 2, FALSE), 500, 2500, "near after the left-out reference");
+  fail_unless_equals_int (cd.buffers, 2);
+  fail_unless_equals_int (cd.gaps, 1);
+  fail_unless_equals_uint64 (cd.gap_ts, GST_SECOND / 30);
+  fail_unless_equals_int (ca.buffers, 2);
+  fail_unless_equals_int (ca.gaps, 1);
+  fail_unless_equals_uint64 (ca.gap_ts, GST_SECOND / 30);
+  g_object_get (el, "stats", &stats, NULL);
+  fail_unless (gst_structure_get_uint64 (stats, "groups", &groups));
+  fail_unless (gst_structure_get_uint64 (stats, "unwrap-references", &refs));
+  fail_unless (gst_structure_get_uint64 (stats, "references-dropped", &dropped));
+  fail_unless_equals_uint64 (groups, 3);
+  fail_unless_equals_uint64 (refs, 1);
+  fail_unless_equals_uint64 (dropped, 1);
+  gst_structure_free (stats);
+  gst_pad_unlink (amp, sinkpad);
+  gst_element_set_state (sink, GST_STATE_NULL);
+  gst_object_unref (sinkpad);
+  gst_object_unref (sink);
+  gst_object_unref (depth);
+  gst_element_release_request_pad (el, amp);
+  gst_object_unref (amp);
+  gst_object_unref (el);
+  gst_harness_teardown (h);
+
+  /* default: the reference is output */
+  h = props_harness (cal, "unwrap=true");
+  push_expect (h, timed (group_at (1, 0.5, 0.5), 0, FALSE), 500, 500, "default: near");
+  push_expect (h, timed (group_at (0, 0.5, 2.5), 1, TRUE), 500, 2500, "default: the reference is output");
+  gst_harness_teardown (h);
+  g_unlink (cal);
+  g_free (cal);
+}
+GST_END_TEST;
+
 static Suite *
 tof_suite (GList ** tcnames, gint iteration, gint duration)
 {
@@ -1203,6 +1330,12 @@ tof_suite (GList ** tcnames, gint iteration, gint duration)
   *tcnames = g_list_append (*tcnames, (gpointer) tcname);
   suite_add_tcase (s, tc);
   tcase_add_loop_test (tc, test_tof_unwrap, start, end);
+
+  tcname = "references";
+  tc = tcase_create (tcname);
+  *tcnames = g_list_append (*tcnames, (gpointer) tcname);
+  suite_add_tcase (s, tc);
+  tcase_add_loop_test (tc, test_tof_references, start, end);
 
   tcname = "stream";
   tc = tcase_create (tcname);

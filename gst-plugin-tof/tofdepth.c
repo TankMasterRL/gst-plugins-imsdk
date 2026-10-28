@@ -30,6 +30,11 @@
  * groups before the first reference too; on the measured distances, before the other passes; once a reference exists
  * the wrap test is not applied to near groups (unwrap supersedes it). One loop for both paths (no NEON variant).
  *
+ * References (arducam-tof-ventuno RUN-0110): a group flagged GST_TOF_FLAG_REFERENCE is computed from its own I/Q and leaves
+ * the temporal-average window as it is, so the near groups on both sides of it average across it (an unflagged mode change
+ * still restarts the window). output-references=false leaves such a group out of every output - unwrap still takes it -
+ * and pushes a GAP event at its PTS instead.
+ *
  * cpu-affinity / util-clamp-min (arducam-tof-ventuno RUN-0098): a scheduling hint for the streaming thread that calls the
  * chain function (without a queue in front, qtitofsrc's), instead of taskset on the whole process. Applied with
  * sched_setaffinity / sched_setattr (SCHED_FLAG_UTIL_CLAMP_MIN, unprivileged) when the first group arrives on a thread; that
@@ -94,6 +99,7 @@ GST_DEBUG_CATEGORY_STATIC (gst_tof_depth_debug);
 #define WRAP_NOISE_Z             3.0     /* noise allowance in sigma (RUN-0090) */
 #define DEFAULT_UNWRAP_DELTA     0.5     /* m: R_near / 4 (RUN-0105) */
 #define DEFAULT_UNWRAP_TOLERANCE 0.15    /* m: 0.075 R_near (RUN-0105) */
+#define DEFAULT_OUTPUT_REFERENCES TRUE
 #define DEFAULT_PROCESSING_LATENCY -1
 #define DEFAULT_UTIL_CLAMP_MIN   -1
 /* automatic processing latency: live p99 after the source push, NEON build, unpinned (arducam-tof-ventuno
@@ -153,6 +159,7 @@ enum
   PROP_UNWRAP,
   PROP_UNWRAP_DELTA,
   PROP_UNWRAP_TOLERANCE,
+  PROP_OUTPUT_REFERENCES,
   PROP_STATS,
 };
 
@@ -224,6 +231,7 @@ struct _GstTofDepth
   gboolean unwrap;              /* far groups as references for near groups */
   gdouble unwrap_delta;         /* m, reference residual limit */
   gdouble unwrap_tolerance;     /* m, carry residual limit */
+  gboolean output_references;   /* FALSE = groups flagged as references are not output */
 
   /* thread hint: set at READY -> PAUSED, applied by the streaming thread, undone at PAUSED -> READY */
   gboolean hint_cpus;           /* hint_set is to be applied */
@@ -267,6 +275,7 @@ struct _GstTofDepth
   guint64 n_uw_refs;
   guint64 n_unwrapped;
   guint64 n_undecided;
+  guint64 n_refs_dropped;
 };
 
 #define gst_tof_depth_parent_class parent_class
@@ -735,6 +744,9 @@ compute (GstTofDepth * self, const guint8 * data, gboolean want_depth)
   min_amp = (gfloat) self->min_amplitude;
   navg = self->temporal_average;
   GST_OBJECT_UNLOCK (self);
+  /* a reference (qtitofsrc far-reference-interval) is computed on its own and leaves the window as it is (RUN-0110) */
+  if (GST_READ_UINT16_LE (data + GST_TOF_OFF_FLAGS) & GST_TOF_FLAG_REFERENCE)
+    navg = 1;
 
   if (navg > 1) {
     /* sliding window over navg groups of the same mode */
@@ -1643,6 +1655,23 @@ thread_hint_apply (GstTofDepth * self)
 
 /* ---------------------------------------------------------------- pads */
 
+/* a reference left out of the outputs (output-references=false, RUN-0110): a GAP event in its place on every linked
+ * output, so sinks and aggregators downstream know that no frame comes for that time */
+static GstFlowReturn
+push_gaps (GstTofDepth * self, const gboolean * active, GstBuffer * inbuf)
+{
+  for (guint k = 0; k < N_OUT; k++) {
+    if (!active[k])
+      continue;
+    if (!push_sticky (self, &self->outs[k]))
+      return GST_FLOW_NOT_NEGOTIATED;
+    if (GST_BUFFER_PTS_IS_VALID (inbuf))
+      gst_pad_push_event (self->outs[k].pad, gst_event_new_gap (GST_BUFFER_PTS (inbuf),
+              GST_BUFFER_DURATION (inbuf)));
+  }
+  return GST_FLOW_OK;
+}
+
 static GstFlowReturn
 gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
 {
@@ -1652,7 +1681,7 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   gboolean active[N_OUT];
   guint mode, flying = 0, wrapped = 0, unwrapped = 0, undecided = 0;
   gfloat flying_thr, wrap_rho, uw_delta, uw_tol;
-  gboolean to_z, unwrap, unwrapped_group = FALSE;
+  gboolean to_z, unwrap, unwrapped_group = FALSE, drop;
   guint64 t0 = g_get_monotonic_time ();
 
   if (self->hint_cpus || self->hint_util_min >= 0)
@@ -1681,6 +1710,7 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   unwrap = self->unwrap;
   uw_delta = (gfloat) self->unwrap_delta;
   uw_tol = (gfloat) self->unwrap_tolerance;
+  drop = !self->output_references && (GST_READ_UINT16_LE (map.data + GST_TOF_OFF_FLAGS) & GST_TOF_FLAG_REFERENCE);
   GST_OBJECT_UNLOCK (self);
 
   if (active[OUT_POINTCLOUD] && !self->zscale) {
@@ -1702,6 +1732,10 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   gst_buffer_unmap (inbuf, &map);
   if (unwrap && (active[OUT_DEPTH] || active[OUT_CONFIDENCE] || active[OUT_POINTCLOUD]))
     unwrapped_group = unwrap_group (self, mode, uw_delta, uw_tol, &unwrapped, &undecided);
+  if (drop) {
+    ret = push_gaps (self, active, inbuf);
+    goto counted;
+  }
   if (wrap_rho > 0.0f && !unwrapped_group &&
       (active[OUT_DEPTH] || active[OUT_CONFIDENCE] || active[OUT_POINTCLOUD]))
     wrapped = remove_wrapped (self, &self->models[mode], wrap_rho);
@@ -1723,11 +1757,13 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
     if (ret != GST_FLOW_OK && ret != GST_FLOW_NOT_LINKED)
       break;
   }
+counted:
   if (!active[OUT_DEPTH] && !active[OUT_AMPLITUDE] && !active[OUT_CONFIDENCE] && !active[OUT_POINTCLOUD])
     ret = GST_FLOW_NOT_LINKED;
 
   GST_OBJECT_LOCK (self);
   self->n_groups++;
+  self->n_refs_dropped += drop;
   self->n_flying += flying;
   self->n_wrap += wrapped;
   self->n_unwrapped += unwrapped;
@@ -2025,6 +2061,9 @@ gst_tof_depth_set_property (GObject * object, guint prop_id, const GValue * valu
     case PROP_UNWRAP_TOLERANCE:
       self->unwrap_tolerance = g_value_get_double (value);
       break;
+    case PROP_OUTPUT_REFERENCES:
+      self->output_references = g_value_get_boolean (value);
+      break;
     case PROP_WRAP_REFLECTIVITY:
       self->wrap_reflectivity = g_value_get_double (value);
       break;
@@ -2118,6 +2157,9 @@ gst_tof_depth_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_UNWRAP_TOLERANCE:
       g_value_set_double (value, self->unwrap_tolerance);
       break;
+    case PROP_OUTPUT_REFERENCES:
+      g_value_set_boolean (value, self->output_references);
+      break;
     case PROP_STATS:
       g_value_take_boxed (value, gst_structure_new ("stats",
               "groups", G_TYPE_UINT64, self->n_groups,
@@ -2129,6 +2171,7 @@ gst_tof_depth_get_property (GObject * object, guint prop_id, GValue * value,
               "unwrap-references", G_TYPE_UINT64, self->n_uw_refs,
               "unwrapped", G_TYPE_UINT64, self->n_unwrapped,
               "unwrap-undecided", G_TYPE_UINT64, self->n_undecided,
+              "references-dropped", G_TYPE_UINT64, self->n_refs_dropped,
               "mean-process-us", G_TYPE_DOUBLE,
               self->n_groups ? self->proc_ns / 1000.0 / self->n_groups : 0.0,
               "thread-cpus", G_TYPE_STRING, self->thread_cpus ? self->thread_cpus : "",
@@ -2211,7 +2254,8 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
   g_object_class_install_property (gobject_class, PROP_TEMPORAL_AVERAGE,
       g_param_spec_uint ("temporal-average", "Temporal average",
           "Average I/Q over a sliding window of N groups of the same mode (software substitute "
-          "for exposure, DEC-0017)", 1, MAX_AVERAGE, DEFAULT_TEMPORAL_AVERAGE,
+          "for exposure, DEC-0017); a far reference group (qtitofsrc far-reference-interval) is not averaged and "
+          "leaves the window as it is", 1, MAX_AVERAGE, DEFAULT_TEMPORAL_AVERAGE,
           rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_FLYING_PIXEL_THRESHOLD,
       g_param_spec_double ("flying-pixel-threshold", "Flying-pixel threshold",
@@ -2228,7 +2272,7 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
       g_param_spec_boolean ("unwrap", "Unwrap near mode",
           "Use every far group as a reference (qtitofsrc far-reference-interval) and output near-mode pixels beyond "
           "the near range at r + R_near; pixels whose reading no longer fits their reference become invalid until "
-          "the next one (RUN-0105). Far groups are output as they are", FALSE, rw | GST_PARAM_MUTABLE_PLAYING));
+          "the next one (RUN-0105). Far groups are output as they are (see output-references)", FALSE, rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_UNWRAP_DELTA,
       g_param_spec_double ("unwrap-delta", "Unwrap reference limit",
           "Largest |r_near + k R_near - r_far| (m) for which a far group sets a pixel's reference", 0.01, 2.0,
@@ -2237,6 +2281,11 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
       g_param_spec_double ("unwrap-tolerance", "Unwrap tolerance",
           "Largest |r + k R_near - reference| (m) for which a near pixel is output; above it the pixel moved and is "
           "invalid until the next reference", 0.01, 1.0, DEFAULT_UNWRAP_TOLERANCE, rw | GST_PARAM_MUTABLE_PLAYING));
+  g_object_class_install_property (gobject_class, PROP_OUTPUT_REFERENCES,
+      g_param_spec_boolean ("output-references", "Output references",
+          "Push the far reference groups (flagged by qtitofsrc far-reference-interval) to the outputs; false = unwrap "
+          "still uses them, but they are left out with a GAP event in their place, so the outputs carry the near "
+          "groups only", DEFAULT_OUTPUT_REFERENCES, rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_DEPTH_TYPE,
       g_param_spec_enum ("depth-type", "Depth type", "Distance definition of the depth output: radial "
           "(along each pixel's ray, as calibrated) or z (along the optical axis, needs a lens model)",
@@ -2266,7 +2315,8 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
   g_object_class_install_property (gobject_class, PROP_STATS,
       g_param_spec_boxed ("stats", "Statistics", "groups, calibration (file in use, \"\" = none), depth-type, lens (file in use, \"\" = none), "
           "flying-pixels (removed in all), wrap-flagged (removed in all), unwrap-references (far groups used), unwrapped "
-          "(pixels output beyond R_near), unwrap-undecided (valid near pixels removed), mean-process-us, thread-cpus and "
+          "(pixels output beyond R_near), unwrap-undecided (valid near pixels removed), references-dropped (references "
+          "left out, output-references=false), mean-process-us, thread-cpus and "
           "thread-util-clamp-min (the streaming thread's, read back after applying a hint; \"\" / -1 = no hint)",
           GST_TYPE_STRUCTURE, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
 
@@ -2324,6 +2374,7 @@ gst_tof_depth_init (GstTofDepth * self)
   self->wrap_reflectivity = DEFAULT_WRAP_REFLECTIVITY;
   self->unwrap_delta = DEFAULT_UNWRAP_DELTA;
   self->unwrap_tolerance = DEFAULT_UNWRAP_TOLERANCE;
+  self->output_references = DEFAULT_OUTPUT_REFERENCES;
   self->depth_type = GST_TOF_DEPTH_RADIAL;
   self->processing_latency = DEFAULT_PROCESSING_LATENCY;
   self->util_clamp_min = DEFAULT_UTIL_CLAMP_MIN;
