@@ -2,38 +2,38 @@
  * Copyright (c) 2026, arducam-tof-ventuno project.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  *
- * ToF suite (RUN-0050, T5.5): qtitofsrc and qtitofdepth (gst-plugin-tof, DEC-0020).
+ * ToF suite: qtitofsrc and qtitofdepth (gst-plugin-tof).
  *   elements      factories, properties and pad templates
  *   stream        live qtitofsrc for the run time: DCS16 headers, consecutive groups, PTS, stats
  *   range-switch  range far -> near in PLAYING: header mode follows, settle drops counted
  *   depth         qtitofdepth on synthetic groups (known phase per pixel) vs the analytic distance,
  *                 uncalibrated (near) and with a pure-offset calibration key file (far)
  *   calibration   calibration unset: the default from GST_TOF_CALIBRATION is used; a missing default
- *                 makes READY -> PAUSED fail; the stats name the file in use (arducam-tof-ventuno DEC-0026)
+ *                 makes READY -> PAUSED fail; the stats name the file in use
  *   flying-pixels a synthetic step 0.8 m | mixed column | 1.4 m: flying-pixel-threshold=0.05 clears exactly the
- *                 mixed column, threshold 0 changes nothing (arducam-tof-ventuno RUN-0080)
+ *                 mixed column, threshold 0 changes nothing
  *   depth-z       depth-type=z with a test lens on a constant-distance group: every pixel = r / |(x, y, 1)| of the
  *                 lens within 1 mm; radial unchanged with a lens set; the calibration's [lens] group is used when
- *                 lens is unset; z without a lens, or with an unusable one, fails to start (arducam-tof-ventuno RUN-0085)
+ *                 lens is unset; z without a lens, or with an unusable one, fails to start
  *   pointcloud    the "pointcloud" pad with a test lens on a constant-distance group with an invalid band: caps parse as
  *                 a FLOAT32 1x180x240x3 tensor (gst_ml_info_from_caps), a tensor meta, every valid point within 0.1 mm
  *                 of r (x, y, 1) / |(x, y, 1)|, invalid points NaN, the same with depth-type=z; no lens -> no start
- *                 (arducam-tof-ventuno RUN-0086)
  *   thread-hint   cpu-affinity=1-2 util-clamp-min=300: the pushing thread gets them (read back from the kernel and in
  *                 the stats), a second pushing thread takes them over and the first gets its own back, teardown
- *                 restores; no hint = no change; an invalid CPU list stops the start (arducam-tof-ventuno RUN-0098)
+ *                 restores; no hint = no change; an invalid CPU list stops the start
  *   unwrap        unwrap=true on synthetic groups (left/right halves at set distances): a near group before the first
  *                 reference is unchanged, a far group (0.5 m | 2.5 m) is output as it is and becomes the reference, the
  *                 next near group reads 0.5 m | 2.5 m, a half that moved 0.4 m is invalid, a half within the tolerance
- *                 follows; unwrap=false leaves every group as computed; the stats count it (arducam-tof-ventuno RUN-0106)
+ *                 follows; unwrap=false leaves every group as computed; the stats count it
  *   references    temporal-average=2 on synthetic groups with PTS: a group flagged reference is output unaveraged and the
  *                 near window goes on across it, an unflagged far group restarts it; output-references=false: the
  *                 reference reaches no output (depth, amplitude), a GAP event at its PTS takes its place on each, unwrap
- *                 still uses it and the stats count it; by default it is output (arducam-tof-ventuno RUN-0110)
+ *                 still uses it and the stats count it; by default it is output
  *   far-reference live qtitofsrc range=near far-reference-interval=10 into qtitofdepth unwrap=true: runs of 10 near
  *                 groups, each far group flagged reference + after-switch, two range writes per reference, 1-3 groups
- *                 dropped per write, the depth element counts every far group as a reference (arducam-tof-ventuno RUN-0106)
- * The live cases need the Arducam ToF on CAMERA0 with the ToF boot entry and drivers loaded.
+ *                 dropped per write, the depth element counts every far group as a reference
+ * The live cases (stream, range-switch, far-reference) need the camera connected and its drivers loaded; qtitofsrc runs
+ * with its defaults.
  */
 
 #ifndef _GNU_SOURCE
@@ -550,7 +550,7 @@ depth_of_constant (const gchar * props, gdouble d)
   return depth;
 }
 
-/* z / r of pixel (u, v): 1 / |(x, y, 1)|, x = xd (1 + k1 rd^2 + k2 rd^4), xd = (u - cx) / f (tools/tof-lens.py) */
+/* z / r of pixel (u, v): 1 / |(x, y, 1)|, x = xd (1 + k1 rd^2 + k2 rd^4), xd = (u - cx) / f (the lens model of qtitofdepth) */
 static gdouble
 lens_zscale (guint u, guint v, gdouble f, gdouble cx, gdouble cy, gdouble k1, gdouble k2)
 {
@@ -1143,7 +1143,7 @@ GST_START_TEST (test_tof_far_reference)
 }
 GST_END_TEST;
 
-/* references (RUN-0110): buffers and GAP events seen on an output */
+/* references: buffers and GAP events seen on an output */
 typedef struct
 {
   guint buffers;

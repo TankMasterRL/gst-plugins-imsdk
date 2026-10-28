@@ -186,13 +186,13 @@ def parse_arguments():
 
     parser.add_argument(
         '-l', '--lens', type=str, default=None,
-        help='Lens key file with a [lens] group (tools/tof-lens.py fit writes '
-             'lens-fit.conf); default: the [lens] group of the calibration'
+        help='Lens key file with a [lens] group (format in the gst-plugin-tof '
+             'README); default: the [lens] group of the calibration'
     )
     parser.add_argument(
         '-c', '--calibration', type=str, default=None,
-        help='Depth calibration key file; default: the installed one '
-             '(/usr/share/arducam-tof/tof-depth-cal-v1.conf or $GST_TOF_CALIBRATION)'
+        help='Depth calibration key file; default: qtitofdepth\'s '
+             '($GST_TOF_CALIBRATION or the path the plugin was built with)'
     )
     parser.add_argument(
         '-f', '--file', type=str, default=None,

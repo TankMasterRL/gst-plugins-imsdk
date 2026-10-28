@@ -1,9 +1,9 @@
 # gst-qimsdk-tof-depth
 
-Sample app for the Arducam ToF camera on the Arduino VENTUNO Q using the standard GStreamer C API and the sample-app
+Sample app for the Arducam ToF camera (`gst-plugin-tof`) using the standard GStreamer C API and the sample-app
 utilities: live depth from `qtitofsrc → qtitofdepth` into an `appsink`, the distance at the image centre once per
 second, a range-mode switch while the pipeline is PLAYING, and the source's controls and statistics read back.
-Generated with the `qimsdk-gstreamer-app-builder` skill and reviewed (arducam-tof-ventuno RUN-0055, T5.5).
+Generated with the `qimsdk-gstreamer-app-builder` skill and reviewed.
 
 ## Files
 
@@ -17,7 +17,7 @@ Generated with the `qimsdk-gstreamer-app-builder` skill and reviewed (arducam-to
 
 ### Text Summary
 
-`qtitofsrc` (range `far`, 300 groups) → `qtitofdepth` (installed calibration) → `capsfilter` `video/x-raw,format=GRAY16_LE,
+`qtitofsrc` (range `far`, 300 groups) → `qtitofdepth` (default calibration) → `capsfilter` `video/x-raw,format=GRAY16_LE,
 width=240,height=180,framerate=30/1` → `appsink` (`new-sample`: centre distance per frame, printed every 30 frames;
 `eos`: final `stats`). A main-loop timeout sets `range` = `near` on `qtitofsrc` after 5 s while PLAYING.
 
@@ -36,12 +36,12 @@ flowchart LR
 
 | Placeholder | Description |
 |---|---|
-| (none) | `calibration` is left unset: `qtitofdepth` uses `/usr/share/arducam-tof/tof-depth-cal-v1.conf` or `$GST_TOF_CALIBRATION` (DEC-0026) |
+| (none) | `calibration` is left unset: `qtitofdepth` uses `$GST_TOF_CALIBRATION` or the default path it was built with (`TOF_DEFAULT_CALIBRATION`, see `gst-plugin-tof/README.md`) |
 
 ## Steps to Run
 
-All files the app references (the installed calibration, and the `qtitof` plugin of this fork on `GST_PLUGIN_PATH`)
-must be present on the device at their referenced paths before running.
+All files the app references (the depth calibration, and the `qtitof` plugin) must be present on the device at their
+referenced paths before running.
 
 ```bash
 # Copy the app to device
@@ -53,10 +53,10 @@ chmod +x ~/gst-qimsdk-tof-depth
 ./gst-qimsdk-tof-depth
 ```
 
-The ToF camera must be available: drivers loaded on the ToF boot entry (`arducam-tof-camss`), and the fork's plugin
-found (`eval "$(~/Downloads/arducam-tof-ventuno/tools/imsdk-build.sh --env)"` on the project's board).
+The ToF camera must be available: the CAMSS and `arducam-pivariety` drivers bound to it (see
+`gst-plugin-tof/README.md`), and the `qtitof` plugin found by GStreamer.
 
-Output on the VENTUNO Q (RUN-0055 step 6, camera facing a surface ≈ 1.8 m away):
+Example output (Arduino VENTUNO Q, camera facing a surface ≈ 1.8 m away):
 
 ```text
 module firmware 0x10002, device id 0x0030
@@ -71,16 +71,15 @@ received 300 depth frames, 29.81 frames/s (PTS), 0 without a valid centre
 
 ## Assumptions
 
-- `qtitofsrc` / `qtitofdepth` are the elements of this fork's `gst-plugin-tof` (`-DENABLE_GST_PLUGIN_TOF=ON`); they
+- `qtitofsrc` / `qtitofdepth` are the elements of `gst-plugin-tof` (`-DENABLE_GST_PLUGIN_TOF=ON`); they
   are not in the skill's plugin catalog. Properties used: `range` (enum, mutable in PLAYING), `num-buffers`,
   `firmware-version`, `device-id`, `stats` (`qtitofsrc`).
 - Without any calibration file `qtitofdepth` stops at start with an error naming the way out; `calibration=""` asks for
-  uncalibrated (non-metric) depth explicitly (DEC-0026, arducam-tof-ventuno RUN-0066).
+  uncalibrated (non-metric) depth explicitly.
 - Near mode is unambiguous only up to 2.0 m (far: 4.0 m); a target beyond that wraps around.
 - `groups-incomplete` may be 1: an incomplete group at stream start, before the first group is pushed.
-- Built in the 1.8.1 fork tree; the `<gst/sampleapps/gst_sample_apps_utils.h>` include resolves through the utils
-  library's in-tree `gst/sampleapps/` header copy. `json-glib-1.0` is required by the template, unused by the app.
-  Subset build: `-DENABLE_GST_SAMPLE_APPS=ON -DGST_SAMPLE_APPS_ONLY=gst-qimsdk-tof-depth`.
+- `<gst_sample_apps_utils.h>` comes from the `gstappsutils` library, as in the other sample apps. `json-glib-1.0` is
+  required by the template, unused by the app.
 
 ## Build Instructions
 

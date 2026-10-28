@@ -193,8 +193,8 @@ def parse_arguments():
     )
     parser.add_argument(
         '-c', '--calibration', type=str, default=None,
-        help='Depth calibration key file (tools/tof-sweep.py); default: the installed one '
-             '(/usr/share/arducam-tof/tof-depth-cal-v1.conf or $GST_TOF_CALIBRATION)'
+        help='Depth calibration key file (format in the gst-plugin-tof README); default: '
+             'qtitofdepth\'s ($GST_TOF_CALIBRATION or the path the plugin was built with)'
     )
 
     return parser.parse_args()

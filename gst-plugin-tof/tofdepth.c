@@ -2,27 +2,27 @@
  * Copyright (c) 2026, arducam-tof-ventuno project.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  *
- * qtitofdepth: DCS16 groups (qtitofsrc) -> calibrated depth, amplitude and confidence (DEC-0020,
- * wiki/ToF-Elements.md).
+ * qtitofdepth: DCS16 groups (qtitofsrc) -> calibrated depth, amplitude and confidence.
  *
- * Per pixel I = F0 - F2, Q = F1 - F3, A = |I + jQ| / 2, phi = atan2 (Q, I) (no offsets, DEC-0018).
- * The calibration (GLib key file written by tools/tof-sweep.py) gives per range mode R, phi_ref and
+ * Per pixel I = F0 - F2, Q = F1 - F3, A = |I + jQ| / 2, phi = atan2 (Q, I) (no offset subtraction: the
+ * module's differential offsets are ~0). The calibration (GLib key file, format in README.md) gives per
+ * range mode R, phi_ref and
  * y(d) = c0 [+ c1 d] + sum_k a_k cos (k theta) + b_k sin (k theta), theta = 2 pi d / R; the radial
  * distance solves d = R / 2pi * (u + y (d)), u = wrap (phi_ref - phi) in [0, 2pi). y depends on d only,
- * so the equation is solved once per mode at load time (fixed-point iteration, as tof-sweep.py) into a
+ * so the equation is solved once per mode at load time (fixed-point iteration) into a
  * table over u; a pixel costs one atan2 and one interpolated lookup.
  *
- * depth-type=z (arducam-tof-ventuno RUN-0085): z = r / |(x, y, 1)| with (x, y) the undistorted normalised
- * coordinates of the pixel, from a lens model (key-file group [lens]: f, cx, cy, k1, k2 - the model of
- * tools/tof-lens.py) in the lens= file or the calibration file; a per-pixel table built at load time, applied
+ * depth-type=z: z = r / |(x, y, 1)| with (x, y) the undistorted normalised coordinates of the pixel,
+ * from a lens model (key-file group [lens]: f, cx, cy, k1, k2 - pinhole with inverse radial distortion,
+ * format in README.md) in the lens= file or the calibration file; a per-pixel table built at load time, applied
  * after the flying-pixel pass.
  *
- * wrap-reflectivity (arducam-tof-ventuno RUN-0090/RUN-0091): one modulation frequency per mode, so a surface beyond R
+ * wrap-reflectivity: one modulation frequency per mode, so a surface beyond R
  * reads r = d - R. A target one range further gives at most rho K / (r + R)^2 (K = wrap_k of the calibration's mode
  * group, the reference target's amplitude x m^2); a valid pixel whose amplitude is not above that bound plus
  * 3 wrap_sigma / sqrt (groups averaged) could be wrapped and becomes invalid, before the flying-pixel pass.
  *
- * unwrap (arducam-tof-ventuno RUN-0105/RUN-0106): near mode reads a surface at d >= R_near as d - R_near. Every far group
+ * unwrap: near mode reads a surface at d >= R_near as d - R_near. Every far group
  * (qtitofsrc far-reference-interval) is a reference: per pixel k = argmin |r_B + k R_near - r_F|, k in {0, 1}, with r_B
  * the latest valid near reading since the previous reference; D = r_B + k R_near if that residual <= unwrap-delta, else
  * the previous D stays. After the first reference a valid near pixel with a D is output at r + k' R_near when
@@ -30,18 +30,18 @@
  * groups before the first reference too; on the measured distances, before the other passes; once a reference exists
  * the wrap test is not applied to near groups (unwrap supersedes it). One loop for both paths (no NEON variant).
  *
- * References (arducam-tof-ventuno RUN-0110): a group flagged GST_TOF_FLAG_REFERENCE is computed from its own I/Q and leaves
+ * References: a group flagged GST_TOF_FLAG_REFERENCE is computed from its own I/Q and leaves
  * the temporal-average window as it is, so the near groups on both sides of it average across it (an unflagged mode change
  * still restarts the window). output-references=false leaves such a group out of every output - unwrap still takes it -
  * and pushes a GAP event at its PTS instead.
  *
- * cpu-affinity / util-clamp-min (arducam-tof-ventuno RUN-0098): a scheduling hint for the streaming thread that calls the
+ * cpu-affinity / util-clamp-min: a scheduling hint for the streaming thread that calls the
  * chain function (without a queue in front, qtitofsrc's), instead of taskset on the whole process. Applied with
  * sched_setaffinity / sched_setattr (SCHED_FLAG_UTIL_CLAMP_MIN, unprivileged) when the first group arrives on a thread; that
  * thread's previous CPU set and uclamp.min are restored at PAUSED -> READY or when another thread takes over. Unset = no call.
  *
  * Pads: "src" (always) depth, GRAY16_LE millimetres or a colour-mapped view; "amplitude" and
- * "confidence" (request); "pointcloud" (request, RUN-0086): the QIM SDK tensor format
+ * "confidence" (request); "pointcloud" (request): the QIM SDK tensor format
  * (neural-network/tensors, FLOAT32, 1 x 180 x 240 x 3 + GstMLTensorMeta), per pixel X, Y, Z in metres
  * (x right, y down, z forward) from the lens model, NaN = invalid. Outputs not linked are not computed. Invalid pixels (amplitude below
  * min-amplitude, or a DCS sample at the 11-bit rails; optionally possible range wraps and flying pixels) are 0.
@@ -96,19 +96,19 @@ GST_DEBUG_CATEGORY_STATIC (gst_tof_depth_debug);
 #define DEFAULT_TEMPORAL_AVERAGE 1
 #define DEFAULT_FLYING_PIXEL_THRESHOLD 0.0
 #define DEFAULT_WRAP_REFLECTIVITY 0.0
-#define WRAP_NOISE_Z             3.0     /* noise allowance in sigma (RUN-0090) */
-#define DEFAULT_UNWRAP_DELTA     0.5     /* m: R_near / 4 (RUN-0105) */
-#define DEFAULT_UNWRAP_TOLERANCE 0.15    /* m: 0.075 R_near (RUN-0105) */
+#define WRAP_NOISE_Z             3.0     /* noise allowance in sigma */
+#define DEFAULT_UNWRAP_DELTA     0.5     /* m: R_near / 4 */
+#define DEFAULT_UNWRAP_TOLERANCE 0.15    /* m: 0.075 R_near */
 #define DEFAULT_OUTPUT_REFERENCES TRUE
 #define DEFAULT_PROCESSING_LATENCY -1
 #define DEFAULT_UTIL_CLAMP_MIN   -1
-/* automatic processing latency: live p99 after the source push, NEON build, unpinned (arducam-tof-ventuno
- * RUN-0064): ~6 ms with one output, ~9.3 ms for the third of three (max 11.2) */
+/* automatic processing latency: live p99 after the source push, NEON build, unpinned, measured on a
+ * QCS8300: ~6 ms with one output, ~9.3 ms for the third of three (max 11.2) */
 #define AUTO_LATENCY_BASE        (4 * GST_MSECOND)
 #define AUTO_LATENCY_PER_OUTPUT  (2500 * GST_USECOND)
 
 #define DEPTH_FORMATS "{ GRAY16_LE, RGBA, BGRA, RGB, BGR, GRAY8 }"
-/* RGB(A) variants replicate the grey value: qtivcomposer (GLES) shows GRAY8 as red only (RUN-0049) */
+/* RGB(A) variants replicate the grey value: qtivcomposer (GLES) shows GRAY8 as red only */
 #define AMPLITUDE_FORMATS "{ GRAY16_LE, GRAY8, RGBA, BGRA, RGB, BGR }"
 #define CONFIDENCE_FORMATS "{ GRAY8, GRAY16_LE, RGBA, BGRA, RGB, BGR }"
 #define VIDEO_CAPS(formats) \
@@ -282,7 +282,7 @@ struct _GstTofDepth
 G_DEFINE_TYPE (GstTofDepth, gst_tof_depth, GST_TYPE_ELEMENT);
 
 #ifdef TOF_HAVE_NEON
-/* NEON path (RUN-0064) unless GST_TOF_DEPTH_SCALAR is set: the scalar code is the reference */
+/* NEON path unless GST_TOF_DEPTH_SCALAR is set: the scalar code is the reference */
 static gboolean use_simd = FALSE;
 #endif
 
@@ -424,14 +424,14 @@ load_calibration (GstTofDepth * self)
   model_init_nominal (&self->models[GST_TOF_RANGE_NEAR], 2.0);
   self->models_loaded = TRUE;
   if (!path) {
-    /* unset: the installed calibration (DEC-0026) */
+    /* unset: the installed calibration; none is an error, so depth is never silently non-metric */
     const gchar *env = g_getenv ("GST_TOF_CALIBRATION");
 
     path = g_strdup (env && *env ? env : TOF_DEFAULT_CALIBRATION);
     if (!g_file_test (path, G_FILE_TEST_IS_REGULAR)) {
       GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
           ("No depth calibration: %s does not exist.", path),
-          ("Set calibration= to a key file written by tools/tof-sweep.py (CAL_OUT=*.conf), or "
+          ("Set calibration= to a depth calibration key file (format in the gst-plugin-tof README), or "
               "calibration=\"\" for uncalibrated depth (not metric); GST_TOF_CALIBRATION sets the default."));
       GST_OBJECT_LOCK (self);
       g_clear_pointer (&self->calibration_used, g_free);
@@ -580,7 +580,7 @@ load_lens (GstTofDepth * self, const gchar * cal_path)
   }
   if (!have && type == GST_TOF_DEPTH_Z) {
     GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("depth-type=z needs a lens model."),
-        ("Set lens= to a key file with a [lens] group (f, cx, cy, k1, optional k2; tools/tof-lens.py writes one), "
+        ("Set lens= to a key file with a [lens] group (f, cx, cy, k1, optional k2), "
             "or add that group to the calibration file."));
     g_free (path);
     return FALSE;
@@ -640,7 +640,7 @@ static const gfloat atan_c[8] = { -0.3333314528f, 0.1999355085f, -0.1420889944f,
 
 /* atan2_f32x4 () for one pixel: the same polynomial, operations and order (fmaf where it fuses), so the scalar loop
  * of compute () is bit-identical to the NEON path. libm atan2f differs from the polynomial by an ulp in about a third
- * of the pixels, which moved 91 of 68.7 M depth values by 1 mm (arducam-tof-ventuno RUN-0106, RUN-0108). */
+ * of the pixels, which moved about 1 in 750 000 depth values by 1 mm. */
 static inline gfloat
 atan2_poly (gfloat y, gfloat x)
 {
@@ -674,7 +674,7 @@ atan2_f32x4 (float32x4_t y, float32x4_t x)
   return vbslq_f32 (vcltq_f32 (y, zero), vnegq_f32 (r), r);
 }
 
-/* the per-pixel loop of compute (), 4 pixels per step; same operations and order as the scalar loop, bit-identical (RUN-0108) */
+/* the per-pixel loop of compute (), 4 pixels per step; same operations and order as the scalar loop, bit-identical */
 static void
 compute_neon (GstTofDepth * self, const gint16 * f0, const gint16 * f1, const gint16 * f2,
     const gint16 * f3, const TofModel * m, gfloat min_amp, guint navg, gboolean want_depth)
@@ -744,7 +744,7 @@ compute (GstTofDepth * self, const guint8 * data, gboolean want_depth)
   min_amp = (gfloat) self->min_amplitude;
   navg = self->temporal_average;
   GST_OBJECT_UNLOCK (self);
-  /* a reference (qtitofsrc far-reference-interval) is computed on its own and leaves the window as it is (RUN-0110) */
+  /* a reference (qtitofsrc far-reference-interval) is computed on its own and leaves the window as it is */
   if (GST_READ_UINT16_LE (data + GST_TOF_OFF_FLAGS) & GST_TOF_FLAG_REFERENCE)
     navg = 1;
 
@@ -827,7 +827,7 @@ compute (GstTofDepth * self, const guint8 * data, gboolean want_depth)
  * range further (r + R) - within the noise allowance - becomes invalid. Radial distance, before the flying pixels.
  * A <= rho K / (r + R)^2 + noise is tested as (A - noise) (r + R)^2 <= rho K (no division); the NEON path does the
  * same float operations in the same order, 4 pixels per step (bit-identical; the scalar loop is latency-bound on the
- * in-order A55, RUN-0091). */
+ * in-order Cortex-A55). */
 static guint
 remove_wrapped (GstTofDepth * self, const TofModel * m, gfloat rho)
 {
@@ -874,7 +874,7 @@ unwrap_reset (GstTofDepth * self)
 
 /* Unwrap (see the top of the file): a far group updates the references, a near group after the first reference is
  * extended by k' R_near or set invalid. The NEON path does the same float operations in the same order, 4 pixels per
- * step (bit-identical; the scalar loop costs +0.6 ms per group on the in-order A55, RUN-0106). Returns TRUE if the
+ * step (bit-identical; the scalar loop costs +0.6 ms per group on the in-order Cortex-A55). Returns TRUE if the
  * group was unwrapped; counts the pixels given + R_near and those removed. */
 static gboolean
 unwrap_group (GstTofDepth * self, guint mode, gfloat delta, gfloat tol, guint * n_unw, guint * n_und)
@@ -1655,7 +1655,7 @@ thread_hint_apply (GstTofDepth * self)
 
 /* ---------------------------------------------------------------- pads */
 
-/* a reference left out of the outputs (output-references=false, RUN-0110): a GAP event in its place on every linked
+/* a reference left out of the outputs (output-references=false): a GAP event in its place on every linked
  * output, so sinks and aggregators downstream know that no frame comes for that time */
 static GstFlowReturn
 push_gaps (GstTofDepth * self, const gboolean * active, GstBuffer * inbuf)
@@ -1723,7 +1723,7 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   if (wrap_rho > 0.0f && (self->models[mode].wrap_k <= 0.0 || self->models[mode].wrap_sigma <= 0.0)) {
     gst_buffer_unmap (inbuf, &map);
     GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS, ("wrap-reflectivity needs the calibration's wrap reference."),
-        ("Add wrap_k and wrap_sigma to its [%s] group (tools/tof-wrap.py conf).",
+        ("Add wrap_k and wrap_sigma to its [%s] group (format in the gst-plugin-tof README).",
             mode == GST_TOF_RANGE_NEAR ? "near" : "far"));
     gst_buffer_unref (inbuf);
     return GST_FLOW_ERROR;
@@ -2224,7 +2224,7 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_CALIBRATION,
       g_param_spec_string ("calibration", "Calibration",
-          "Key file with the per-mode depth model (tools/tof-sweep.py CAL_OUT=*.conf); unset = "
+          "Key file with the per-mode depth model (format in the gst-plugin-tof README); unset = "
           "$GST_TOF_CALIBRATION or " TOF_DEFAULT_CALIBRATION " (error if missing); \"\" = uncalibrated, "
           "not metric", NULL, rw | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_MIN_AMPLITUDE,
@@ -2254,7 +2254,8 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
   g_object_class_install_property (gobject_class, PROP_TEMPORAL_AVERAGE,
       g_param_spec_uint ("temporal-average", "Temporal average",
           "Average I/Q over a sliding window of N groups of the same mode (software substitute "
-          "for exposure, DEC-0017); a far reference group (qtitofsrc far-reference-interval) is not averaged and "
+          "for exposure, which module firmware 0x10002 ignores); a far reference group (qtitofsrc "
+          "far-reference-interval) is not averaged and "
           "leaves the window as it is", 1, MAX_AVERAGE, DEFAULT_TEMPORAL_AVERAGE,
           rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_FLYING_PIXEL_THRESHOLD,
@@ -2266,13 +2267,13 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
       g_param_spec_double ("wrap-reflectivity", "Wrap reflectivity",
           "Invalidate pixels that may lie one range further (beyond 2 m near / 4 m far): those whose amplitude "
           "a target this bright, relative to the calibration's wrap reference (wrap_k, wrap_sigma of each mode), "
-          "could give from there; 2 = the measured setting (RUN-0090), 0 = off", 0.0, 100.0,
+          "could give from there; 2 = twice as bright as the reference target (the tested setting), 0 = off", 0.0, 100.0,
           DEFAULT_WRAP_REFLECTIVITY, rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_UNWRAP,
       g_param_spec_boolean ("unwrap", "Unwrap near mode",
           "Use every far group as a reference (qtitofsrc far-reference-interval) and output near-mode pixels beyond "
           "the near range at r + R_near; pixels whose reading no longer fits their reference become invalid until "
-          "the next one (RUN-0105). Far groups are output as they are (see output-references)", FALSE, rw | GST_PARAM_MUTABLE_PLAYING));
+          "the next one. Far groups are output as they are (see output-references)", FALSE, rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_UNWRAP_DELTA,
       g_param_spec_double ("unwrap-delta", "Unwrap reference limit",
           "Largest |r_near + k R_near - r_far| (m) for which a far group sets a pixel's reference", 0.01, 2.0,
@@ -2293,7 +2294,8 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
   g_object_class_install_property (gobject_class, PROP_LENS,
       g_param_spec_string ("lens", "Lens model",
           "Key file with a [lens] group (f, cx, cy, k1, optional k2: pinhole + inverse radial distortion, "
-          "tools/tof-lens.py); unset = the calibration file's [lens] group, if it has one. Needed by depth-type=z",
+          "format in the gst-plugin-tof README); unset = the calibration file's [lens] group, if it has one. "
+          "Needed by depth-type=z",
           NULL, rw | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_PROCESSING_LATENCY,
       g_param_spec_int64 ("processing-latency", "Processing latency",
@@ -2303,7 +2305,7 @@ gst_tof_depth_class_init (GstTofDepthClass * klass)
   g_object_class_install_property (gobject_class, PROP_CPU_AFFINITY,
       g_param_spec_string ("cpu-affinity", "CPU affinity",
           "CPUs the streaming thread that runs this element may use, a list as for taskset -c (\"0-3\" = the "
-          "Cortex-A78C cores of the VENTUNO Q); without a queue in front this is also qtitofsrc's thread. Applied when "
+          "Cortex-A78C cores of a QCS8300); without a queue in front this is also qtitofsrc's thread. Applied when "
           "the first group arrives, undone at stop; unset = the thread is left alone", NULL,
           rw | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_UTIL_CLAMP_MIN,

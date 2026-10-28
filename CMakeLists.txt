@@ -31,6 +31,8 @@ option(ENABLE_GST_PLUGIN_CAMIMGREPROC "Enable gst-plugin-camimgreproc" ${ENABLE_
 option(ENABLE_GST_PLUGIN_CAMREPROC "Enable gst-plugin-camreproc" ${ENABLE_GST_CAMERA_PLUGINS})
 option(ENABLE_GST_PLUGIN_JPEGENC "Enable gst-plugin-jpegenc" ${ENABLE_GST_CAMERA_PLUGINS})
 option(ENABLE_GST_PLUGIN_QMMFSRC "Enable gst-plugin-qmmfsrc" ${ENABLE_GST_CAMERA_PLUGINS})
+# Arducam ToF on the upstream CAMSS driver (no CamX)
+option(ENABLE_GST_PLUGIN_TOF "Enable gst-plugin-tof" ${ENABLE_GST_IMSDK_PLUGINS})
 
 # External Software Plugins
 option(ENABLE_GST_PLUGIN_REDISSINK "Enable gst-plugin-redissink" ${ENABLE_GST_EXT_SOFTWARE_PLUGINS})
@@ -71,9 +73,6 @@ option(ENABLE_GST_PLUGIN_RTSPBIN "Enable gst-plugin-rtspbin" ${ENABLE_GST_SOFTWA
 option(ENABLE_GST_PLUGIN_SOCKET "Enable gst-plugin-socket" ${ENABLE_GST_SOFTWARE_PLUGINS})
 option(ENABLE_GST_PLUGIN_URIDECODEBIN "Enable gst-plugin-uridecodebin" ${ENABLE_GST_SOFTWARE_PLUGINS})
 option(ENABLE_GST_PLUGIN_VIDEOTEMPLATE "Enable gst-plugin-videotemplate" ${ENABLE_GST_SOFTWARE_PLUGINS})
-
-# Arducam ToF camera on the CAMSS RDI path (fork addition, DEC-0020)
-option(ENABLE_GST_PLUGIN_TOF "Enable gst-plugin-tof" OFF)
 
 # Python extension module
 option(ENABLE_GST_PYTHON "Enable gst-python libraries" OFF)
@@ -148,6 +147,7 @@ add_plugin_if(ENABLE_GST_PLUGIN_CAMIMGREPROC    gst-plugin-camimgreproc)
 add_plugin_if(ENABLE_GST_PLUGIN_CAMREPROC       gst-plugin-camreproc)
 add_plugin_if(ENABLE_GST_PLUGIN_JPEGENC         gst-plugin-jpegenc)
 add_plugin_if(ENABLE_GST_PLUGIN_QMMFSRC         gst-plugin-qmmfsrc)
+add_plugin_if(ENABLE_GST_PLUGIN_TOF             gst-plugin-tof)
 
 # External Software Plugins
 add_plugin_if(ENABLE_GST_PLUGIN_REDISSINK       gst-plugin-redissink)
@@ -186,7 +186,6 @@ add_plugin_if(ENABLE_GST_PLUGIN_RTSPBIN         gst-plugin-rtspbin)
 add_plugin_if(ENABLE_GST_PLUGIN_SOCKET          gst-plugin-socket)
 add_plugin_if(ENABLE_GST_PLUGIN_URIDECODEBIN    gst-plugin-uridecodebin)
 add_plugin_if(ENABLE_GST_PLUGIN_VIDEOTEMPLATE   gst-plugin-videotemplate)
-add_plugin_if(ENABLE_GST_PLUGIN_TOF            gst-plugin-tof)
 
 # Software Plugins (prop)
 add_plugin_if(ENABLE_GST_PLUGIN_SMARTVENCBIN    gst-plugin-smartvencbin)

@@ -2,7 +2,7 @@
  * Copyright (c) 2026, arducam-tof-ventuno project.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  *
- * DCS16 group buffers exchanged between qtitofsrc and qtitofdepth (DEC-0020, wiki/ToF-Elements.md):
+ * DCS16 group buffers exchanged between qtitofsrc and qtitofdepth:
  * a 64-byte little-endian header followed by four 240x180 planes of int16 (F0..F3, the module's
  * 11-bit two's-complement samples sign-extended, row stride 480 bytes).
  */
@@ -31,7 +31,7 @@ G_BEGIN_DECLS
 /* header flags */
 #define GST_TOF_FLAG_MODE_DETECTED   (1 << 0) /* mode measured from the data; else assumed */
 #define GST_TOF_FLAG_AFTER_SWITCH    (1 << 1) /* first group pushed after a range write */
-#define GST_TOF_FLAG_REFERENCE       (1 << 2) /* far group taken by far-reference-interval (RUN-0106) */
+#define GST_TOF_FLAG_REFERENCE       (1 << 2) /* far group taken by far-reference-interval */
 
 /* header field offsets */
 #define GST_TOF_OFF_MAGIC      0

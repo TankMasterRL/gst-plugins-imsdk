@@ -2,7 +2,7 @@
  * Copyright (c) 2026, arducam-tof-ventuno project.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  *
- * Plugin qtitof: elements for the Arducam ToF camera on the CAMSS RDI path (DEC-0020).
+ * Plugin qtitof: elements for the Arducam ToF camera on the CAMSS RDI path.
  */
 
 #ifdef HAVE_CONFIG_H

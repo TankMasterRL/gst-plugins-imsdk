@@ -2,24 +2,24 @@
  * Copyright (c) 2026, arducam-tof-ventuno project.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  *
- * qtitofsrc: Arducam ToF camera on the CAMSS RDI path of the VENTUNO Q (DEC-0020, ToF-Elements).
+ * qtitofsrc: Arducam ToF camera (arducam-pivariety sensor driver) on the CAMSS RDI path.
  *
  * Finds the qcom-camss media device, links csiphyN -> csidN -> vfeN_rdi0 and sets 240x180
- * SRGGB12_1X12 on every pad, holds the CSI mux line, streams the RDI node (MMAP) and assembles the
- * module's frames into groups of 4 DCS frames: a group starts after a gap of more than 10 ms and is
- * 4 frames with consecutive sequence numbers (RUN-0036). Each group is pushed as one DCS16 buffer
- * (tofdcs.h). The data has no scene-independent mode signature, so the header carries the requested
- * mode and groups that may still be in another mode are dropped (RUN-0047): frames before the first
- * gap after STREAMON and the next STREAMON_DROP_GROUPS groups (the module starts in its default mode),
- * and after a range write every group whose first frame starts less than settle-time after the write
- * (measured: groups starting <= 17 ms after it are in the old mode, 37-39 ms old, mixed or blank,
- * >= 49 ms in the new mode).
+ * SRGGB12_1X12 on every pad, holds the CSI mux line if the board has one, streams the RDI node (MMAP)
+ * and assembles the module's frames into groups of 4 DCS frames: the module sends 4 frames in a burst
+ * at 30 groups/s (120 frames/s), so a group starts after a gap of more than 10 ms and is 4 frames with
+ * consecutive sequence numbers. Each group is pushed as one DCS16 buffer (tofdcs.h). The data has no
+ * scene-independent mode signature, so the header carries the requested mode and groups that may still
+ * be in another mode are dropped: frames before the first gap after STREAMON and the next
+ * STREAMON_DROP_GROUPS groups (the module starts in its default mode), and after a range write every
+ * group whose first frame starts less than settle-time after the write (measured: groups starting
+ * <= 17 ms after it are in the old mode, 37-39 ms old, mixed or blank, >= 49 ms in the new mode).
  *
- * far-reference-interval (arducam-tof-ventuno RUN-0105/RUN-0106): with range=near, after N pushed near groups the
- * source writes far and, after the next pushed far group, near again (the same write and settle-time drop as a range
- * change). That far group carries GST_TOF_FLAG_REFERENCE: qtitofdepth unwrap decides from it per pixel whether a
- * near reading is r or r + R. The range property keeps the requested mode; its read-back from the driver shows far
- * during a reference.
+ * far-reference-interval: with range=near, after N pushed near groups the source writes far and, after
+ * the next pushed far group, near again (the same write and settle-time drop as a range change). That
+ * far group carries GST_TOF_FLAG_REFERENCE: qtitofdepth unwrap decides from it per pixel whether a near
+ * reading is r or r + R. The range property keeps the requested mode; its read-back from the driver
+ * shows far during a reference.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -46,7 +46,8 @@
 GST_DEBUG_CATEGORY_STATIC (gst_tof_src_debug);
 #define GST_CAT_DEFAULT gst_tof_src_debug
 
-/* Sensor controls (arducam-pivariety with patches 0004 and 0006) */
+/* Sensor controls of arducam-pivariety: trigger_mode (range) and frame_rate; the read-only
+ * firmware_version and device_id are optional (start works without them, reported as 0) */
 #define CID_TRIGGER_MODE      0x00981901
 #define CID_FRAME_RATE        0x00981906
 #define CID_FIRMWARE_VERSION  0x00981a00
@@ -56,14 +57,14 @@ GST_DEBUG_CATEGORY_STATIC (gst_tof_src_debug);
 #define GROUP_GAP_NS          (10 * GST_MSECOND)
 #define GROUP_DURATION        (GST_SECOND / 30)
 /* a group is complete 11.6 ms after its first frame (4-phase burst) and pushed <= 14.9 ms after it
- * (arducam-tof-ventuno RUN-0058, RUN-0064): the min latency, not a whole group period */
+ * (measured on a QCS8300): the min latency, not a whole group period */
 #define GROUP_LATENCY         (15 * GST_MSECOND)
 #define NO_FRAME_TIMEOUT      GST_SECOND
 #define FIRMWARE_IGNORES_EXPOSURE 0x10002
 
 #define DEFAULT_CSIPHY        0
 #define DEFAULT_SETUP         TRUE
-#define DEFAULT_MUX_GPIO      "gpiochip2:24=1"
+#define DEFAULT_MUX_GPIO      "auto"
 #define DEFAULT_RANGE         GST_TOF_RANGE_FAR
 #define DEFAULT_EXPOSURE      800
 #define DEFAULT_FRAME_RATE    60
@@ -313,7 +314,92 @@ set_pad_format (GstTofSrc * self, const struct media_entity_desc *e, guint pad)
   return ok;
 }
 
-/* mux-gpio "gpiochipN:LINE=VALUE"; returns the line request fd, -1 if not held */
+/* Boards with a CSI mux in front of a connector: mux-gpio=auto holds the line that routes it to csiphy */
+static const struct
+{
+  const gchar *compatible;      /* any entry of the device tree root's compatible */
+  guint csiphy;
+  const gchar *chip_label;      /* gpiochip label, the index depends on probe order */
+  guint line;
+  guint value;
+} known_muxes[] = {
+  /* Arduino VENTUNO Q: TLMM GPIO 24 high routes the CAMERA0 connector to CSIPHY0; at 0 no frame reaches CSID */
+  { "arduino,monza", 0, "f100000.pinctrl", 24, 1 },
+};
+
+static gboolean
+board_is_compatible (const gchar * compatible)
+{
+  gchar *contents = NULL;
+  gsize len = 0;
+  gboolean found = FALSE;
+
+  if (!g_file_get_contents ("/sys/firmware/devicetree/base/compatible", &contents, &len, NULL))
+    return FALSE;
+  /* NUL-separated list */
+  for (gsize i = 0; i < len && !found; i += strlen (contents + i) + 1)
+    found = g_strcmp0 (contents + i, compatible) == 0;
+  g_free (contents);
+  return found;
+}
+
+/* "gpiochipN" of the chip labelled label, NULL if none */
+static gchar *
+find_gpiochip (const gchar * label)
+{
+  GDir *dir;
+  const gchar *entry;
+  gchar *found = NULL;
+
+  if (!(dir = g_dir_open ("/dev", 0, NULL)))
+    return NULL;
+  while (!found && (entry = g_dir_read_name (dir))) {
+    struct gpiochip_info info;
+    gchar *path;
+    gint fd;
+
+    if (!g_str_has_prefix (entry, "gpiochip"))
+      continue;
+    path = g_build_filename ("/dev", entry, NULL);
+    fd = open (path, O_RDONLY | O_CLOEXEC);
+    g_free (path);
+    if (fd < 0)
+      continue;
+    memset (&info, 0, sizeof (info));
+    if (xioctl (fd, GPIO_GET_CHIPINFO_IOCTL, &info) == 0 && g_strcmp0 (info.label, label) == 0)
+      found = g_strdup (entry);
+    close (fd);
+  }
+  g_dir_close (dir);
+  return found;
+}
+
+/* mux-gpio=auto: the known_muxes line for this board and csiphy as "gpiochipN:LINE=VALUE", NULL if none */
+static gchar *
+auto_mux_gpio (GstTofSrc * self)
+{
+  for (guint i = 0; i < G_N_ELEMENTS (known_muxes); i++) {
+    gchar *chip, *spec;
+
+    if (known_muxes[i].csiphy != self->csiphy || !board_is_compatible (known_muxes[i].compatible))
+      continue;
+    if (!(chip = find_gpiochip (known_muxes[i].chip_label))) {
+      GST_WARNING_OBJECT (self, "mux-gpio auto: %s, but no gpiochip labelled %s",
+          known_muxes[i].compatible, known_muxes[i].chip_label);
+      return NULL;
+    }
+    spec = g_strdup_printf ("%s:%u=%u", chip, known_muxes[i].line, known_muxes[i].value);
+    GST_INFO_OBJECT (self, "mux-gpio auto: %s csiphy %u -> %s (%s line %u = %u)",
+        known_muxes[i].compatible, self->csiphy, spec, known_muxes[i].chip_label,
+        known_muxes[i].line, known_muxes[i].value);
+    g_free (chip);
+    return spec;
+  }
+  GST_INFO_OBJECT (self, "mux-gpio auto: no known CSI mux for this board and csiphy %u", self->csiphy);
+  return NULL;
+}
+
+/* mux-gpio "gpiochipN:LINE=VALUE", "auto" or ""; returns the line request fd, -1 if not held */
 static gint
 hold_gpio (GstTofSrc * self, const gchar * spec)
 {
@@ -325,6 +411,13 @@ hold_gpio (GstTofSrc * self, const gchar * spec)
 
   if (!spec || !*spec)
     return -1;
+  if (g_strcmp0 (spec, "auto") == 0) {
+    gchar *resolved = auto_mux_gpio (self);
+
+    fd = resolved ? hold_gpio (self, resolved) : -1;
+    g_free (resolved);
+    return fd;
+  }
   if (sscanf (spec, "%31[^:]:%u=%u", chip, &line, &value) != 3) {
     GST_WARNING_OBJECT (self, "mux-gpio '%s' not understood (gpiochipN:LINE=VALUE)", spec);
     return -1;
@@ -346,7 +439,7 @@ hold_gpio (GstTofSrc * self, const gchar * spec)
   req.config.attrs[0].attr.values = value ? 1 : 0;
   req.config.attrs[0].mask = 1;
   if (xioctl (fd, GPIO_V2_GET_LINE_IOCTL, &req) < 0) {
-    /* someone else (e.g. tools/tof-media.sh mux 1) may already hold it at the right level */
+    /* another process may already hold it at the right level */
     GST_WARNING_OBJECT (self, "cannot hold %s line %u: %s - continuing", path, line,
         g_strerror (errno));
     close (fd);
@@ -392,7 +485,7 @@ warn_ignored (GstTofSrc * self, const gchar * what)
 {
   if (self->firmware_version == FIRMWARE_IGNORES_EXPOSURE && !self->warned_ignored) {
     GST_WARNING_OBJECT (self, "%s is accepted but ignored by module firmware "
-        "0x%x (DEC-0017): the module runs at a fixed 120 frames/s and exposure",
+        "0x%x: the module runs at a fixed 120 frames/s and exposure",
         what, self->firmware_version);
     self->warned_ignored = TRUE;
   }
@@ -516,7 +609,7 @@ gst_tof_src_start (GstBaseSrc * basesrc)
   close (media_fd);
 
   /* controls on the sensor subdev; the driver applies them at stream on (it powers the module only while
-   * streaming, arducam-tof-ventuno DEC-0030) */
+   * streaming) */
   self->subdev_path = devnode_path (sensor.dev.major, sensor.dev.minor);
   GST_OBJECT_LOCK (self);
   self->subdev_fd = self->subdev_path ? open (self->subdev_path, O_RDWR | O_CLOEXEC) : -1;
@@ -529,7 +622,7 @@ gst_tof_src_start (GstBaseSrc * basesrc)
   self->firmware_version = read_ctrl (self->subdev_fd, CID_FIRMWARE_VERSION, &v) ? (guint32) v : 0;
   self->device_id = read_ctrl (self->subdev_fd, CID_DEVICE_ID, &v) ? (guint32) v : 0;
   if (!self->firmware_version)
-    GST_WARNING_OBJECT (self, "driver has no firmware_version control (patch 0006)");
+    GST_WARNING_OBJECT (self, "driver has no firmware_version control: firmware-version and device-id stay 0");
   apply_range (self);
   self->drop_before_ts = 0;     /* covered by the drop after STREAMON */
   self->drop_left = STREAMON_DROP_GROUPS;
@@ -687,7 +780,7 @@ gst_tof_src_query (GstBaseSrc * basesrc, GstQuery * query)
   return GST_BASE_SRC_CLASS (gst_tof_src_parent_class)->query (basesrc, query);
 }
 
-/* RAW12 MIPI packing (2 pixels in 3 bytes) -> int16, 11-bit two's complement (RUN-0035/0036) */
+/* RAW12 MIPI packing (2 pixels in 3 bytes) -> int16: the module's samples are 11-bit two's complement */
 static void
 unpack_frame (const guint8 * src, guint stride, guint8 * dst)
 {
@@ -751,8 +844,8 @@ gst_tof_src_create (GstPushSrc * pushsrc, GstBuffer ** out)
     }
     self->streaming = TRUE;
     self->last_frame_wall = monotonic_ns ();
-    /* the module starts in its default (far) mode and switches like after a range write
-     * (RUN-0047), so the groups right after STREAMON are dropped the same way */
+    /* the module starts in its default (far) mode and switches like after a range write,
+     * so the groups right after STREAMON are dropped the same way */
     GST_OBJECT_LOCK (self);
     self->drop_left = STREAMON_DROP_GROUPS;
     GST_OBJECT_UNLOCK (self);
@@ -993,7 +1086,7 @@ gst_tof_src_get_property (GObject * object, guint prop_id, GValue * value,
       g_value_set_string (value, self->mux_gpio);
       break;
     case PROP_RANGE:
-      /* read back from the driver while open (the MCU itself cannot report it, DEC-0015) */
+      /* read back from the driver while open (the module MCU itself cannot report it) */
       g_value_set_enum (value, read_ctrl (self->subdev_fd, CID_TRIGGER_MODE, &v) ?
           (v ? GST_TOF_RANGE_NEAR : GST_TOF_RANGE_FAR) : self->range);
       break;
@@ -1074,7 +1167,7 @@ gst_tof_src_class_init (GstTofSrcClass * klass)
           NULL, rw | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_CSIPHY,
       g_param_spec_uint ("csiphy", "CSIPHY",
-          "CSI path msm_csiphyN -> msm_csidN -> msm_vfeN_rdi0 (CAMERA0 = 0)",
+          "CSI path msm_csiphyN -> msm_csidN -> msm_vfeN_rdi0",
           0, 3, DEFAULT_CSIPHY, rw | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_SETUP_PIPELINE,
       g_param_spec_boolean ("setup-pipeline", "Set up pipeline",
@@ -1082,7 +1175,8 @@ gst_tof_src_class_init (GstTofSrcClass * klass)
           DEFAULT_SETUP, rw | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_MUX_GPIO,
       g_param_spec_string ("mux-gpio", "Mux GPIO",
-          "CSI mux line held while streaming, gpiochipN:LINE=VALUE (empty = untouched)",
+          "CSI mux line held while streaming, gpiochipN:LINE=VALUE; \"auto\" = the line of a known board "
+          "for this csiphy (Arduino VENTUNO Q CAMERA0), none elsewhere; empty = untouched",
           DEFAULT_MUX_GPIO, rw | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_RANGE,
       g_param_spec_enum ("range", "Range",
@@ -1090,7 +1184,7 @@ gst_tof_src_class_init (GstTofSrcClass * klass)
           GST_TYPE_TOF_RANGE, DEFAULT_RANGE, rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_EXPOSURE,
       g_param_spec_int ("exposure", "Exposure",
-          "Module exposure control (ignored by module firmware 0x10002, DEC-0017)",
+          "Module exposure control (ignored by module firmware 0x10002)",
           1, 65523, DEFAULT_EXPOSURE, rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_FRAME_RATE,
       g_param_spec_int ("frame-rate", "Frame rate",
@@ -1108,12 +1202,12 @@ gst_tof_src_class_init (GstTofSrcClass * klass)
   g_object_class_install_property (gobject_class, PROP_SETTLE_TIME,
       g_param_spec_uint ("settle-time", "Settle time (ms)",
           "After a range change, drop groups whose first frame starts sooner than this "
-          "(the module switches 40-50 ms after the write, RUN-0047)",
+          "(the module switches 40-50 ms after the write)",
           0, 1000, DEFAULT_SETTLE_MS, rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_FAR_REFERENCE_INTERVAL,
       g_param_spec_uint ("far-reference-interval", "Far reference interval",
           "With range=near, take one far group after this many near groups, flagged as a reference for "
-          "qtitofdepth unwrap (each costs the far group and the groups dropped at two range writes, RUN-0105); "
+          "qtitofdepth unwrap (each costs the far group and the groups dropped at two range writes); "
           "0 = off", 0, G_MAXUINT, 0, rw | GST_PARAM_MUTABLE_PLAYING));
   g_object_class_install_property (gobject_class, PROP_STATS,
       g_param_spec_boxed ("stats", "Statistics",

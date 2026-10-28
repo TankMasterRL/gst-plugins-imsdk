@@ -2,7 +2,7 @@
  * Copyright (c) 2026, arducam-tof-ventuno project.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  *
- * gst-qimsdk-tof-depth: Arducam ToF depth with the standard GStreamer C API (RUN-0055, T5.5).
+ * gst-qimsdk-tof-depth: Arducam ToF depth with the standard GStreamer C API.
  *
  *   qtitofsrc -> qtitofdepth -> capsfilter (GRAY16_LE 240x180) -> appsink
  *
@@ -18,7 +18,7 @@
 #include <gst/video/video.h>
 #include <glib.h>
 
-#include <gst/sampleapps/gst_sample_apps_utils.h>
+#include <gst_sample_apps_utils.h>
 
 /* Run length, range modes and the moment of the switch (30 groups/s). */
 #define DURATION_S      10
@@ -26,8 +26,8 @@
 #define SWITCH_RANGE    "near"
 #define SWITCH_AT_S     5
 
-/* Depth calibration: qtitofdepth loads the installed one (/usr/share/arducam-tof/tof-depth-cal-v1.conf,
- * or $GST_TOF_CALIBRATION) when "calibration" is unset, and refuses to start without one (DEC-0026). */
+/* Depth calibration: qtitofdepth loads its default ($GST_TOF_CALIBRATION, or the path the plugin was built
+ * with) when "calibration" is unset, and refuses to start without one, so depth is never silently non-metric. */
 
 /* qtitofdepth output: 240x180 GRAY16_LE, value = distance in mm, 0 = invalid. */
 #define DEPTH_WIDTH     240
@@ -194,7 +194,7 @@ create_pipe (GstAppContext * appctx, TofDepthState * state)
   GstCaps *caps = NULL;
 
   /* Create all elements */
-  /* ToF source from the gst-plugins-imsdk fork: sets up the CAMSS path itself */
+  /* ToF source: sets up the CAMSS path itself */
   tofsrc = gst_element_factory_make ("qtitofsrc", "tofsrc");
   if (!tofsrc) {
     g_printerr ("Failed to create qtitofsrc\n");
@@ -226,7 +226,7 @@ create_pipe (GstAppContext * appctx, TofDepthState * state)
   gst_element_set_enum_property (tofsrc, "range", START_RANGE);
   /* num-buffers ends the stream (EOS) after DURATION_S seconds of groups */
   g_object_set (G_OBJECT (tofsrc), "num-buffers", DURATION_S * DEPTH_FPS, NULL);
-  /* "calibration" left unset: the installed calibration (see above) */
+  /* "calibration" left unset: qtitofdepth's default calibration (see above) */
 
   caps = gst_caps_new_simple ("video/x-raw",
       "format", G_TYPE_STRING, "GRAY16_LE",

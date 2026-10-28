@@ -20,11 +20,11 @@ pkg_check_modules(GST_QCOM_VIDEO
   REQUIRED gstreamer-qcom-oss-video-1.0>=1.0.0)
 pkg_check_modules(GST_QCOM_ALLOC
   REQUIRED gstreamer-qcom-oss-allocators-1.0>=1.0.0)
-# qtitofdepth "pointcloud": the QIM SDK tensor caps and GstMLTensorMeta (arducam-tof-ventuno RUN-0086)
+# qtitofdepth "pointcloud": the QIM SDK tensor caps and GstMLTensorMeta
 pkg_check_modules(GST_QCOM_ML
   REQUIRED gstreamer-qcom-oss-ml-1.0>=1.0.0)
 
-# qtitofdepth: calibration used when the property is unset (installed by gstreamer1.0-qtitof, arducam-tof-ventuno DEC-0026)
+# qtitofdepth: calibration key file used when the property is unset (none is installed with the plugin)
 set(TOF_DEFAULT_CALIBRATION "/usr/share/arducam-tof/tof-depth-cal-v1.conf"
     CACHE STRING "Calibration key file qtitofdepth loads when calibration is unset")
 
@@ -39,7 +39,7 @@ add_definitions(-DHAVE_CONFIG_H)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Werror")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-unused-parameter")
 
-# GStreamer plugin: qtitofsrc (T5.2) and qtitofdepth (T5.3), DEC-0020.
+# GStreamer plugin: qtitofsrc and qtitofdepth.
 set(GST_QTI_TOF gstqtitof)
 
 add_library(${GST_QTI_TOF} SHARED
