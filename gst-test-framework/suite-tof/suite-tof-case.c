@@ -1266,6 +1266,109 @@ GST_START_TEST (test_tof_references)
 }
 GST_END_TEST;
 
+/* as a group read by filesrc: no timestamps */
+static GstBuffer *
+untimed (GstBuffer * buf)
+{
+  GST_BUFFER_PTS (buf) = GST_BUFFER_DTS (buf) = GST_BUFFER_DURATION (buf) = GST_CLOCK_TIME_NONE;
+  return buf;
+}
+
+/* push one group, check the timestamps of its depth output against group n of a 30/s stream */
+static void
+push_expect_ts (GstHarness * h, GstBuffer * in, guint64 n, const gchar * what)
+{
+  GstClockTime pts = gst_util_uint64_scale (n, GST_SECOND, 30);
+  GstClockTime dur = gst_util_uint64_scale (n + 1, GST_SECOND, 30) - pts;
+  GstBuffer *out;
+
+  fail_unless_equals_int (gst_harness_push (h, in), GST_FLOW_OK);
+  out = gst_harness_pull (h);
+  fail_unless (out != NULL, "%s: no output", what);
+  fail_unless (GST_BUFFER_PTS (out) == pts && GST_BUFFER_DURATION (out) == dur,
+      "%s: pts %" GST_TIME_FORMAT " duration %" GST_TIME_FORMAT ", expected %" GST_TIME_FORMAT " %" GST_TIME_FORMAT,
+      what, GST_TIME_ARGS (GST_BUFFER_PTS (out)), GST_TIME_ARGS (GST_BUFFER_DURATION (out)), GST_TIME_ARGS (pts),
+      GST_TIME_ARGS (dur));
+  gst_buffer_unref (out);
+}
+
+/* the next segment event the harness received: TIME, starting at start */
+static void
+expect_time_segment (GstHarness * h, GstClockTime start, const gchar * what)
+{
+  GstEvent *ev;
+
+  while ((ev = gst_harness_try_pull_event (h))) {
+    if (GST_EVENT_TYPE (ev) == GST_EVENT_SEGMENT) {
+      const GstSegment *seg;
+
+      gst_event_parse_segment (ev, &seg);
+      fail_unless (seg->format == GST_FORMAT_TIME && seg->start == start && seg->time == start,
+          "%s: %s segment start %" G_GUINT64_FORMAT ", expected TIME %" G_GUINT64_FORMAT, what,
+          gst_format_get_name (seg->format), seg->start, start);
+      gst_event_unref (ev);
+      return;
+    }
+    gst_event_unref (ev);
+  }
+  fail ("%s: no segment", what);
+}
+
+/* A replay from a file runs in filesrc's BYTES segment with untimed groups: the outputs get a TIME segment from the
+ * first group and timestamps from the group count, as aggregators such as qtivcomposer require */
+GST_START_TEST (test_tof_bytes_segment)
+{
+  gchar *cal = write_tmp ("[calibration]\nformat=2\n"
+      "[far]\nR=4.0\nphi_ref=0\nc0=0\n[near]\nR=2.0\nphi_ref=0\nc0=0\n");
+  GstHarness *h = props_harness (cal, "");
+  GstElement *el;
+  GstPad *depth;
+  GstSegment seg;
+  RefCount cd = { 0 };
+
+  gst_segment_init (&seg, GST_FORMAT_BYTES);
+  fail_unless (gst_harness_push_event (h, gst_event_new_segment (&seg)));
+  for (guint n = 0; n < 4; n++)
+    push_expect_ts (h, untimed (group_at (1, 0.5, 0.5)), n, "BYTES from 0");
+  expect_time_segment (h, 0, "BYTES from 0");
+  /* a TIME segment again: the input timestamps are kept, as from qtitofsrc */
+  gst_segment_init (&seg, GST_FORMAT_TIME);
+  fail_unless (gst_harness_push_event (h, gst_event_new_segment (&seg)));
+  push_expect_ts (h, timed (group_at (1, 0.5, 0.5), 7, FALSE), 7, "TIME after BYTES");
+  expect_time_segment (h, 0, "TIME after BYTES");
+  gst_harness_teardown (h);
+
+  /* a BYTES seek to group 100 */
+  h = props_harness (cal, "");
+  gst_segment_init (&seg, GST_FORMAT_BYTES);
+  seg.start = seg.time = seg.position = 100 * TOF_SIZE;
+  fail_unless (gst_harness_push_event (h, gst_event_new_segment (&seg)));
+  push_expect_ts (h, untimed (group_at (1, 0.5, 0.5)), 100, "BYTES from group 100");
+  push_expect_ts (h, untimed (group_at (1, 0.5, 0.5)), 101, "BYTES from group 100");
+  expect_time_segment (h, gst_util_uint64_scale (100, GST_SECOND, 30), "BYTES from group 100");
+  gst_harness_teardown (h);
+
+  /* a left-out reference: its GAP event at the group's time */
+  h = props_harness (cal, "unwrap=true output-references=false");
+  el = gst_harness_find_element (h, "qtitofdepth");
+  depth = gst_element_get_static_pad (el, "src");
+  gst_pad_add_probe (depth, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, ref_count_probe, &cd, NULL);
+  gst_segment_init (&seg, GST_FORMAT_BYTES);
+  fail_unless (gst_harness_push_event (h, gst_event_new_segment (&seg)));
+  push_expect_ts (h, untimed (group_at (1, 0.5, 0.5)), 0, "near before the reference");
+  fail_unless_equals_int (gst_harness_push (h, untimed (timed (group_at (0, 0.5, 2.5), 0, TRUE))), GST_FLOW_OK);
+  fail_unless_equals_int (gst_harness_buffers_in_queue (h), 0);
+  push_expect_ts (h, untimed (group_at (1, 0.5, 0.5)), 2, "near after the left-out reference");
+  fail_unless_equals_int (cd.gaps, 1);
+  fail_unless_equals_uint64 (cd.gap_ts, gst_util_uint64_scale (1, GST_SECOND, 30));
+  gst_object_unref (depth);
+  gst_object_unref (el);
+  gst_harness_teardown (h);
+  g_unlink (cal);
+  g_free (cal);
+}
+GST_END_TEST;
+
 static Suite *
 tof_suite (GList ** tcnames, gint iteration, gint duration)
 {
@@ -1336,6 +1439,12 @@ tof_suite (GList ** tcnames, gint iteration, gint duration)
   *tcnames = g_list_append (*tcnames, (gpointer) tcname);
   suite_add_tcase (s, tc);
   tcase_add_loop_test (tc, test_tof_references, start, end);
+
+  tcname = "bytes-segment";
+  tc = tcase_create (tcname);
+  *tcnames = g_list_append (*tcnames, (gpointer) tcname);
+  suite_add_tcase (s, tc);
+  tcase_add_loop_test (tc, test_tof_bytes_segment, start, end);
 
   tcname = "stream";
   tc = tcase_create (tcname);

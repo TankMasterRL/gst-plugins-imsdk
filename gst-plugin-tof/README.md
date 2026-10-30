@@ -54,6 +54,7 @@ gst-launch-1.0 qtitofsrc range=near num-buffers=300 ! qtitofdepth name=d \
     d.confidence ! queue ! video/x-raw,format=GRAY8 ! filesink location=confidence.raw
 
 # record the raw groups (345 664 bytes each), compute depth later with any calibration
+# (a replay is timed from the group count at the caps framerate, so it can also feed qtivcomposer)
 gst-launch-1.0 qtitofsrc range=near num-buffers=300 ! filesink location=tof.dcs
 gst-launch-1.0 filesrc location=tof.dcs blocksize=345664 \
     ! 'video/x-tof-dcs,format=DCS16,width=240,height=180,phases=4,framerate=30/1' \
@@ -61,7 +62,7 @@ gst-launch-1.0 filesrc location=tof.dcs blocksize=345664 \
 ```
 
 Samples: `gst-sample-apps/gst-qimsdk-tof-depth` (C), `gst-python-examples/gst-tof-depth.py` and
-`gst-tof-pointcloud.py` (Python GI). Tests: `gst-test-framework -s tof` (13 cases; three need the camera).
+`gst-tof-pointcloud.py` (Python GI). Tests: `gst-test-framework -s tof` (14 cases; three need the camera).
 
 ## Depth calibration key file
 

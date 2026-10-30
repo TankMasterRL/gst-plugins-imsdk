@@ -250,6 +250,8 @@ struct _GstTofDepth
   gboolean models_loaded;
   GstEvent *stream_start;
   GstSegment segment;
+  gboolean count_ts;            /* upstream segment not TIME: timestamps from the group count */
+  guint64 ts_group;             /* index of the next group in that segment */
   gint fps_n, fps_d;
   guint8 turbo[256][3];
   gfloat *dist;                 /* metres, 0 = invalid */
@@ -1655,6 +1657,15 @@ thread_hint_apply (GstTofDepth * self)
 
 /* ---------------------------------------------------------------- pads */
 
+/* start of group n at the caps framerate (30/1 when the caps give none) */
+static GstClockTime
+group_time (GstTofDepth * self, guint64 n)
+{
+  if (self->fps_n <= 0)
+    return gst_util_uint64_scale (n, GST_SECOND, 30);
+  return gst_util_uint64_scale (n, self->fps_d * GST_SECOND, self->fps_n);
+}
+
 /* a reference left out of the outputs (output-references=false): a GAP event in its place on every linked
  * output, so sinks and aggregators downstream know that no frame comes for that time */
 static GstFlowReturn
@@ -1689,6 +1700,14 @@ gst_tof_depth_chain (GstPad * pad, GstObject * parent, GstBuffer * inbuf)
   if (!self->models_loaded && !load_models (self)) {
     gst_buffer_unref (inbuf);
     return GST_FLOW_ERROR;
+  }
+  if (self->count_ts) {
+    /* replay from a file: the outputs and GAP events take these timestamps */
+    inbuf = gst_buffer_make_writable (inbuf);
+    GST_BUFFER_PTS (inbuf) = group_time (self, self->ts_group);
+    GST_BUFFER_DURATION (inbuf) = group_time (self, self->ts_group + 1) - GST_BUFFER_PTS (inbuf);
+    GST_BUFFER_DTS (inbuf) = GST_CLOCK_TIME_NONE;
+    self->ts_group++;
   }
   if (!gst_buffer_map (inbuf, &map, GST_MAP_READ))
     goto map_failed;
@@ -1828,12 +1847,27 @@ gst_tof_depth_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
       gst_event_unref (event);
       return TRUE;
     }
-    case GST_EVENT_SEGMENT:
-      gst_event_copy_segment (event, &self->segment);
+    case GST_EVENT_SEGMENT:{
+      const GstSegment *in;
+
+      gst_event_parse_segment (event, &in);
+      self->count_ts = in->format != GST_FORMAT_TIME;
+      if (!self->count_ts) {
+        gst_event_copy_segment (event, &self->segment);
+      } else {
+        /* a replay from a file (BYTES, group-sized blocks): video consumers such as aggregators need TIME, so
+         * the outputs get a TIME segment from the first group and timestamps from the group count */
+        self->ts_group = in->format == GST_FORMAT_BYTES ? in->start / GST_TOF_BUFFER_SIZE : 0;
+        gst_segment_init (&self->segment, GST_FORMAT_TIME);
+        self->segment.start = self->segment.time = group_time (self, self->ts_group);
+        GST_DEBUG_OBJECT (self, "%s segment from group %" G_GUINT64_FORMAT ", outputs in TIME",
+            gst_format_get_name (in->format), self->ts_group);
+      }
       for (guint k = 0; k < N_OUT; k++)
         self->outs[k].need_segment = TRUE;
       gst_event_unref (event);
       return TRUE;
+    }
     case GST_EVENT_FLUSH_STOP:
       gst_flow_combiner_reset (self->combiner);
       self->hist_count = self->hist_pos = 0;
@@ -1991,6 +2025,7 @@ gst_tof_depth_change_state (GstElement * element, GstStateChange transition)
       return GST_STATE_CHANGE_FAILURE;
     }
     gst_segment_init (&self->segment, GST_FORMAT_TIME);
+    self->count_ts = FALSE;
     gst_flow_combiner_reset (self->combiner);
     self->hist_count = self->hist_pos = 0;
     g_clear_pointer (&self->hist, g_free);
