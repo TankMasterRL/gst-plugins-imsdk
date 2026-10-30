@@ -34,6 +34,10 @@ firmware 0x10002.
 
 - The module sends a burst of 4 frames every 33.3 ms (120 frames/s), whatever `frame-rate` is set to; `exposure` is
   also accepted and ignored. `qtitofdepth temporal-average` is the software substitute for a longer exposure.
+- The module runs on its own clock, slightly off 30 groups/s (30.011/s on the module tested). `qtitofsrc` announces 30/1.
+  Elements that resample to the caps rate, such as `qtivcomposer`, then drop one group whenever the two drift a period
+  apart, which is every 90 s on that module. `qtitofsrc announced-rate=30011/1000` (the measured rate) puts the true rate in
+  the caps; `qtitofdepth` passes it on to its outputs.
 - `range=far`: unambiguous range R = 4 m; `range=near`: R = 2 m (twice the modulation frequency).
   A surface beyond R reads as d − R. `wrap-reflectivity` can remove such pixels, and with
   `qtitofsrc far-reference-interval=N` `qtitofdepth unwrap=true` can output them at their true distance.
@@ -62,7 +66,7 @@ gst-launch-1.0 filesrc location=tof.dcs blocksize=345664 \
 ```
 
 Samples: `gst-sample-apps/gst-qimsdk-tof-depth` (C), `gst-python-examples/gst-tof-depth.py` and
-`gst-tof-pointcloud.py` (Python GI). Tests: `gst-test-framework -s tof` (15 cases; three need the camera).
+`gst-tof-pointcloud.py` (Python GI). Tests: `gst-test-framework -s tof` (16 cases; four need the camera).
 
 ## Depth calibration key file
 

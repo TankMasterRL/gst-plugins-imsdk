@@ -55,7 +55,6 @@ GST_DEBUG_CATEGORY_STATIC (gst_tof_src_debug);
 
 #define RAW_LINE_BYTES        360
 #define GROUP_GAP_NS          (10 * GST_MSECOND)
-#define GROUP_DURATION        (GST_SECOND / 30)
 /* a group is complete 11.6 ms after its first frame (4-phase burst) and pushed <= 14.9 ms after it
  * (measured on a QCS8300): the min latency, not a whole group period */
 #define GROUP_LATENCY         (15 * GST_MSECOND)
@@ -70,6 +69,8 @@ GST_DEBUG_CATEGORY_STATIC (gst_tof_src_debug);
 #define DEFAULT_FRAME_RATE    60
 #define DEFAULT_V4L2_BUFFERS  8
 #define DEFAULT_SETTLE_MS     60
+#define DEFAULT_RATE_N        30
+#define DEFAULT_RATE_D        1
 #define STREAMON_DROP_GROUPS  2
 
 enum
@@ -88,6 +89,7 @@ enum
   PROP_NUM_V4L2_BUFFERS,
   PROP_SETTLE_TIME,
   PROP_FAR_REFERENCE_INTERVAL,
+  PROP_ANNOUNCED_RATE,
   PROP_STATS,
 };
 
@@ -115,6 +117,7 @@ struct _GstTofSrc
   guint n_v4l2_buffers;
   guint settle_ms;
   guint far_ref_interval;       /* near groups between far references, 0 = off */
+  gint rate_n, rate_d;          /* framerate in the caps */
 
   /* device state (object lock for subdev_fd users outside the streaming thread) */
   gint video_fd;
@@ -765,6 +768,25 @@ gst_tof_src_unlock_stop (GstBaseSrc * basesrc)
   return TRUE;
 }
 
+/* the template with the framerate fixed to announced-rate */
+static GstCaps *
+gst_tof_src_get_caps (GstBaseSrc * basesrc, GstCaps * filter)
+{
+  GstTofSrc *self = GST_TOF_SRC (basesrc);
+  GstCaps *caps = gst_caps_make_writable (gst_pad_get_pad_template_caps (GST_BASE_SRC_PAD (basesrc)));
+
+  GST_OBJECT_LOCK (self);
+  gst_caps_set_simple (caps, "framerate", GST_TYPE_FRACTION, self->rate_n, self->rate_d, NULL);
+  GST_OBJECT_UNLOCK (self);
+  if (filter) {
+    GstCaps *tmp = gst_caps_intersect_full (filter, caps, GST_CAPS_INTERSECT_FIRST);
+
+    gst_caps_unref (caps);
+    caps = tmp;
+  }
+  return caps;
+}
+
 static gboolean
 gst_tof_src_query (GstBaseSrc * basesrc, GstQuery * query)
 {
@@ -988,7 +1010,7 @@ gst_tof_src_create (GstPushSrc * pushsrc, GstBuffer ** out)
       gst_buffer_unmap (self->pending, &self->pmap);
 
       GST_BUFFER_PTS (self->pending) = running_time_of (self, self->ts[0]);
-      GST_BUFFER_DURATION (self->pending) = GROUP_DURATION;
+      GST_BUFFER_DURATION (self->pending) = gst_util_uint64_scale_int (GST_SECOND, self->rate_d, self->rate_n);
       GST_BUFFER_OFFSET (self->pending) = self->group_seq;
       *out = self->pending;
       self->pending = NULL;
@@ -1054,6 +1076,10 @@ gst_tof_src_set_property (GObject * object, guint prop_id, const GValue * value,
     case PROP_FAR_REFERENCE_INTERVAL:
       self->far_ref_interval = g_value_get_uint (value);
       break;
+    case PROP_ANNOUNCED_RATE:
+      self->rate_n = gst_value_get_fraction_numerator (value);
+      self->rate_d = gst_value_get_fraction_denominator (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -1112,6 +1138,9 @@ gst_tof_src_get_property (GObject * object, guint prop_id, GValue * value,
       break;
     case PROP_FAR_REFERENCE_INTERVAL:
       g_value_set_uint (value, self->far_ref_interval);
+      break;
+    case PROP_ANNOUNCED_RATE:
+      gst_value_set_fraction (value, self->rate_n, self->rate_d);
       break;
     case PROP_STATS:
       g_value_take_boxed (value, gst_structure_new ("stats",
@@ -1209,6 +1238,12 @@ gst_tof_src_class_init (GstTofSrcClass * klass)
           "With range=near, take one far group after this many near groups, flagged as a reference for "
           "qtitofdepth unwrap (each costs the far group and the groups dropped at two range writes); "
           "0 = off", 0, G_MAXUINT, 0, rw | GST_PARAM_MUTABLE_PLAYING));
+  g_object_class_install_property (gobject_class, PROP_ANNOUNCED_RATE,
+      gst_param_spec_fraction ("announced-rate", "Announced rate",
+          "Group rate written into the caps and buffer durations. The module runs on its own clock, slightly off "
+          "30 groups/s; set its measured rate here when a downstream element resamples to the caps rate "
+          "(qtivcomposer and other video aggregators drop a group whenever the two drift one period apart)",
+          1, 1, 1000, 1, DEFAULT_RATE_N, DEFAULT_RATE_D, rw | GST_PARAM_MUTABLE_READY));
   g_object_class_install_property (gobject_class, PROP_STATS,
       g_param_spec_boxed ("stats", "Statistics",
           "groups-pushed, groups-incomplete, frames-stray, sequence-gaps, "
@@ -1224,6 +1259,7 @@ gst_tof_src_class_init (GstTofSrcClass * klass)
   basesrc_class->unlock = GST_DEBUG_FUNCPTR (gst_tof_src_unlock);
   basesrc_class->unlock_stop = GST_DEBUG_FUNCPTR (gst_tof_src_unlock_stop);
   basesrc_class->query = GST_DEBUG_FUNCPTR (gst_tof_src_query);
+  basesrc_class->get_caps = GST_DEBUG_FUNCPTR (gst_tof_src_get_caps);
   pushsrc_class->create = GST_DEBUG_FUNCPTR (gst_tof_src_create);
 
   GST_DEBUG_CATEGORY_INIT (gst_tof_src_debug, "qtitofsrc", 0, "Arducam ToF source");
@@ -1240,6 +1276,8 @@ gst_tof_src_init (GstTofSrc * self)
   self->frame_rate = DEFAULT_FRAME_RATE;
   self->n_v4l2_buffers = DEFAULT_V4L2_BUFFERS;
   self->settle_ms = DEFAULT_SETTLE_MS;
+  self->rate_n = DEFAULT_RATE_N;
+  self->rate_d = DEFAULT_RATE_D;
   self->video_fd = self->subdev_fd = self->gpio_fd = -1;
   self->applied_range = DEFAULT_RANGE;
   self->poll = gst_poll_new (TRUE);

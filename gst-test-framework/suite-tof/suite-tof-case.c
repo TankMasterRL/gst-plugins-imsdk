@@ -1453,6 +1453,94 @@ GST_START_TEST (test_tof_alignment)
 }
 GST_END_TEST;
 
+typedef struct
+{
+  gint src_n, src_d, out_n, out_d;
+  guint buffers, bad_duration;
+  GstClockTime duration;
+} RateSeen;
+
+/* on qtitofsrc's src pad: the caps rate and every group's duration; on the sink after qtitofdepth: its caps rate */
+static GstPadProbeReturn
+rate_probe (GstPad * pad, GstPadProbeInfo * info, gpointer data)
+{
+  RateSeen *r = data;
+  gboolean out = GST_PAD_DIRECTION (pad) == GST_PAD_SINK;
+
+  if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER) {
+    r->buffers++;
+    if (GST_BUFFER_DURATION (GST_PAD_PROBE_INFO_BUFFER (info)) != r->duration)
+      r->bad_duration++;
+  } else if (GST_EVENT_TYPE (GST_PAD_PROBE_INFO_EVENT (info)) == GST_EVENT_CAPS) {
+    GstCaps *caps;
+
+    gst_event_parse_caps (GST_PAD_PROBE_INFO_EVENT (info), &caps);
+    gst_structure_get_fraction (gst_caps_get_structure (caps, 0), "framerate",
+        out ? &r->out_n : &r->src_n, out ? &r->out_d : &r->src_d);
+  }
+  return GST_PAD_PROBE_OK;
+}
+
+/* qtitofsrc PROPS ! qtitofdepth ! fakesink, 10 live groups: both caps carry n/d, every group lasts d/n s */
+static void
+expect_rate (const gchar * cal, const gchar * props, gint n, gint d)
+{
+  gchar *desc = g_strdup_printf ("qtitofsrc name=s range=near num-buffers=10 %s ! qtitofdepth calibration=\"%s\" "
+      "! fakesink name=k sync=false", props, cal);
+  GError *err = NULL;
+  GstElement *pipeline = gst_parse_launch (desc, &err), *s, *k;
+  GstPad *sp, *kp;
+  RateSeen r = { 0 };
+
+  fail_unless (pipeline != NULL, "parse: %s", err ? err->message : "?");
+  r.duration = gst_util_uint64_scale_int (GST_SECOND, d, n);
+  s = gst_bin_get_by_name (GST_BIN (pipeline), "s");
+  k = gst_bin_get_by_name (GST_BIN (pipeline), "k");
+  sp = gst_element_get_static_pad (s, "src");
+  kp = gst_element_get_static_pad (k, "sink");
+  gst_pad_add_probe (sp, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, rate_probe, &r, NULL);
+  gst_pad_add_probe (kp, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, rate_probe, &r, NULL);
+  run_until_eos (pipeline, 15);
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  fail_unless (r.src_n == n && r.src_d == d, "'%s': qtitofsrc caps %d/%d, expected %d/%d", props, r.src_n, r.src_d,
+      n, d);
+  fail_unless (r.out_n == n && r.out_d == d, "'%s': qtitofdepth output caps %d/%d, expected %d/%d", props, r.out_n,
+      r.out_d, n, d);
+  fail_unless_equals_int (r.buffers, 10);
+  fail_unless (r.bad_duration == 0, "'%s': %u groups not lasting %" GST_TIME_FORMAT, props, r.bad_duration,
+      GST_TIME_ARGS (r.duration));
+  gst_object_unref (sp);
+  gst_object_unref (kp);
+  gst_object_unref (s);
+  gst_object_unref (k);
+  gst_object_unref (pipeline);
+  g_free (desc);
+}
+
+/* announced-rate: the rate qtitofsrc writes into its caps and durations, which qtitofdepth passes on (aggregators
+ * downstream resample to it); default 30/1 */
+GST_START_TEST (test_tof_announced_rate)
+{
+  gchar *cal = write_tmp ("[calibration]\nformat=2\n"
+      "[far]\nR=4.0\nphi_ref=0\nc0=0\n[near]\nR=2.0\nphi_ref=0\nc0=0\n");
+  GstElement *src = gst_element_factory_make ("qtitofsrc", NULL);
+  GParamSpec *ps = g_object_class_find_property (G_OBJECT_GET_CLASS (src), "announced-rate");
+  GstParamSpecFraction *f;
+
+  fail_unless (ps != NULL && GST_IS_PARAM_SPEC_FRACTION (ps), "qtitofsrc lacks announced-rate");
+  f = GST_PARAM_SPEC_FRACTION (ps);
+  fail_unless (f->def_num == 30 && f->def_den == 1, "default %d/%d", f->def_num, f->def_den);
+  fail_unless (f->min_num == 1 && f->min_den == 1 && f->max_num == 1000 && f->max_den == 1,
+      "range %d/%d - %d/%d", f->min_num, f->min_den, f->max_num, f->max_den);
+  fail_unless (ps->flags & GST_PARAM_MUTABLE_READY);
+  gst_object_unref (src);
+  expect_rate (cal, "", 30, 1);
+  expect_rate (cal, "announced-rate=30011/1000", 30011, 1000);
+  g_unlink (cal);
+  g_free (cal);
+}
+GST_END_TEST;
+
 static Suite *
 tof_suite (GList ** tcnames, gint iteration, gint duration)
 {
@@ -1556,6 +1644,13 @@ tof_suite (GList ** tcnames, gint iteration, gint duration)
   suite_add_tcase (s, tc);
   tcase_set_timeout (tc, 40);
   tcase_add_loop_test (tc, test_tof_far_reference, start, end);
+
+  tcname = "announced-rate";
+  tc = tcase_create (tcname);
+  *tcnames = g_list_append (*tcnames, (gpointer) tcname);
+  suite_add_tcase (s, tc);
+  tcase_set_timeout (tc, 40);
+  tcase_add_loop_test (tc, test_tof_announced_rate, start, end);
 
   return s;
 }

@@ -14,9 +14,10 @@
 
 G_BEGIN_DECLS
 
+/* qtitofsrc fixes the framerate to its announced-rate (default 30/1) */
 #define GST_TOF_DCS_CAPS \
   "video/x-tof-dcs, format=(string)DCS16, width=(int)240, height=(int)180, " \
-  "phases=(int)4, framerate=(fraction)30/1"
+  "phases=(int)4, framerate=(fraction)[ 0/1, 1000/1 ]"
 
 #define GST_TOF_WIDTH          240
 #define GST_TOF_HEIGHT         180
