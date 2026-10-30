@@ -76,6 +76,7 @@
 #include <gst/video/video.h>
 #include <gst/allocators/gstqtiallocator.h>
 #include <gst/video/gstimagepool.h>
+#include <gst/video/video-utils.h>
 #include <gst/ml/ml-info.h>
 #include <gst/ml/gstmlmeta.h>
 
@@ -1286,12 +1287,14 @@ fill_pointcloud (GstTofDepth * self, gfloat * out)
 
 /* ---------------------------------------------------------------- negotiation and pools */
 
+/* align: the row layout downstream asked for, NULL = the default layout */
 static GstBufferPool *
-create_pool (GstTofDepth * self, GstCaps * caps, GstVideoInfo * info)
+create_pool (GstTofDepth * self, GstCaps * caps, GstVideoInfo * info, const GstVideoAlignment * align)
 {
   GstBufferPool *pool = gst_image_buffer_pool_new ();
   GstAllocator *allocator = gst_qti_allocator_new (GST_FD_MEMORY_FLAG_KEEP_MAPPED);
   GstStructure *config;
+  gsize size = info->size;
 
   if (!pool || !allocator) {
     GST_WARNING_OBJECT (self, "no QIM image pool / QTI allocator, using a video pool");
@@ -1306,7 +1309,18 @@ create_pool (GstTofDepth * self, GstCaps * caps, GstVideoInfo * info)
     gst_buffer_pool_config_add_option (config, GST_IMAGE_BUFFER_POOL_OPTION_KEEP_MAPPED);
   }
   gst_buffer_pool_config_add_option (config, GST_BUFFER_POOL_OPTION_VIDEO_META);
-  gst_buffer_pool_config_set_params (config, caps, info->size, 2, 0);
+  if (align) {
+    GstVideoAlignment a = *align;
+    GstVideoInfo ainfo = *info;
+
+    if (gst_video_info_align (&ainfo, &a)) {
+      gst_buffer_pool_config_add_option (config, GST_BUFFER_POOL_OPTION_VIDEO_ALIGNMENT);
+      gst_buffer_pool_config_set_video_alignment (config, &a);
+      size = ainfo.size;
+      GST_DEBUG_OBJECT (self, "rows aligned as downstream asks: stride %d", GST_VIDEO_INFO_PLANE_STRIDE (&ainfo, 0));
+    }
+  }
+  gst_buffer_pool_config_set_params (config, caps, size, 2, 0);
   if (!gst_buffer_pool_set_config (pool, config)) {
     GST_ERROR_OBJECT (self, "pool configuration rejected");
     gst_clear_object (&pool);
@@ -1363,6 +1377,8 @@ push_sticky (GstTofDepth * self, TofOut * out)
   if (out->need_caps) {
     GstCaps *tmpl = gst_pad_get_pad_template_caps (out->pad), *peer, *caps;
     GstQuery *query;
+    GstVideoAlignment align;
+    gboolean answered, aligned = FALSE;
 
     tmpl = gst_caps_make_writable (tmpl);
     gst_caps_set_simple (tmpl, "framerate", GST_TYPE_FRACTION, self->fps_n, self->fps_d, NULL);
@@ -1389,7 +1405,8 @@ push_sticky (GstTofDepth * self, TofOut * out)
       gst_clear_object (&out->pool);
     }
     query = gst_query_new_allocation (caps, TRUE);
-    if (gst_pad_peer_query (out->pad, query) && gst_query_get_n_allocation_pools (query) > 0) {
+    answered = gst_pad_peer_query (out->pad, query);
+    if (answered && gst_query_get_n_allocation_pools (query) > 0) {
       GstBufferPool *pool = NULL;
       guint size, min, max;
 
@@ -1407,9 +1424,13 @@ push_sticky (GstTofDepth * self, TofOut * out)
         gst_object_unref (pool);
       }
     }
+    /* GPU consumers (qtivcomposer, ...) ask for a row alignment with the video meta; a tee passes that on without
+     * their pool, and the GPU cannot import rows of the default layout (GRAY8: 240 bytes) */
+    if (!out->pool && answered)
+      aligned = gst_query_parse_video_alignment (query, &align);
     gst_query_unref (query);
     if (!out->pool)
-      out->pool = create_pool (self, caps, &out->info);
+      out->pool = create_pool (self, caps, &out->info, aligned ? &align : NULL);
     gst_caps_unref (caps);
     if (!out->pool || !gst_buffer_pool_set_active (out->pool, TRUE)) {
       GST_ELEMENT_ERROR (self, RESOURCE, NO_SPACE_LEFT, ("Cannot activate the buffer pool of %s.",

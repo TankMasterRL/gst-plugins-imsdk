@@ -48,6 +48,7 @@
 #include <glib/gstdio.h>
 
 #include "plugin-suite.h"
+#include <gst/video/video.h>
 #include <gst/ml/ml-info.h>
 #include <gst/ml/gstmlmeta.h>
 
@@ -1369,6 +1370,89 @@ GST_START_TEST (test_tof_bytes_segment)
 }
 GST_END_TEST;
 
+/* qtitofdepth in format, its sink proposing the video meta with 128-byte rows (as qtivcomposer does) or nothing */
+static GstHarness *
+align_harness (const gchar * cal, const gchar * format, gboolean ask)
+{
+  gchar *launch = g_strdup_printf ("qtitofdepth calibration=\"%s\"", cal);
+  gchar *caps = g_strdup_printf ("video/x-raw, format=(string)%s, width=(int)240, height=(int)180, "
+      "framerate=(fraction)30/1", format);
+  GstHarness *h = gst_harness_new_parse (launch);
+
+  if (ask) {
+    GstStructure *params = gst_structure_new_empty ("video-meta");
+    GstVideoAlignment align;
+
+    gst_video_alignment_reset (&align);
+    align.stride_align[0] = 127;
+    gst_buffer_pool_config_set_video_alignment (params, &align);
+    gst_harness_add_propose_allocation_meta (h, GST_VIDEO_META_API_TYPE, params);
+    gst_structure_free (params);
+  }
+  gst_harness_set_src_caps_str (h, TOF_DCS_CAPS);
+  gst_harness_set_sink_caps_str (h, caps);
+  g_free (caps);
+  g_free (launch);
+  return h;
+}
+
+/* push one group at 0.5 m, check the row stride of the output's video meta; for GRAY16_LE also every pixel (500 mm) */
+static void
+expect_stride (GstHarness * h, gint stride, const gchar * what)
+{
+  GstBuffer *out;
+  GstVideoMeta *meta;
+  GstMapInfo map;
+
+  fail_unless_equals_int (gst_harness_push (h, timed (group_at (1, 0.5, 0.5), 0, FALSE)), GST_FLOW_OK);
+  out = gst_harness_pull (h);
+  fail_unless (out != NULL, "%s: no output", what);
+  meta = gst_buffer_get_video_meta (out);
+  fail_unless (meta != NULL, "%s: no video meta", what);
+  fail_unless (meta->stride[0] == stride, "%s: stride %d, expected %d", what, meta->stride[0], stride);
+  gst_buffer_map (out, &map, GST_MAP_READ);
+  fail_unless (map.size >= meta->offset[0] + (gsize) stride * TOF_H, "%s: %" G_GSIZE_FORMAT " bytes", what, map.size);
+  if (meta->format == GST_VIDEO_FORMAT_GRAY16_LE)
+    for (guint y = 0; y < TOF_H; y++)
+      for (guint x = 0; x < TOF_W; x++) {
+        gint got = GST_READ_UINT16_LE (map.data + meta->offset[0] + y * stride + 2 * x);
+
+        fail_unless (ABS (got - 500) <= 3, "%s: pixel %u,%u %d mm, expected 500", what, x, y, got);
+      }
+  gst_buffer_unmap (out, &map);
+  gst_buffer_unref (out);
+}
+
+/* GPU consumers such as qtivcomposer ask for a row alignment with the video meta; a tee passes it on without their
+ * pool, and qtitofdepth's own pool follows it. Without such a request the rows keep the default layout */
+GST_START_TEST (test_tof_alignment)
+{
+  gchar *cal = write_tmp ("[calibration]\nformat=2\n"
+      "[far]\nR=4.0\nphi_ref=0\nc0=0\n[near]\nR=2.0\nphi_ref=0\nc0=0\n");
+  static const struct
+  {
+    const gchar *format;
+    gint plain, aligned;
+  } cases[] = { {"GRAY8", 240, 256}, {"GRAY16_LE", 480, 512}, {"RGBA", 960, 1024} };
+
+  for (guint i = 0; i < G_N_ELEMENTS (cases); i++) {
+    gchar *what = g_strdup_printf ("%s, no request", cases[i].format);
+    GstHarness *h = align_harness (cal, cases[i].format, FALSE);
+
+    expect_stride (h, cases[i].plain, what);
+    gst_harness_teardown (h);
+    g_free (what);
+    what = g_strdup_printf ("%s, 128-byte rows asked", cases[i].format);
+    h = align_harness (cal, cases[i].format, TRUE);
+    expect_stride (h, cases[i].aligned, what);
+    gst_harness_teardown (h);
+    g_free (what);
+  }
+  g_unlink (cal);
+  g_free (cal);
+}
+GST_END_TEST;
+
 static Suite *
 tof_suite (GList ** tcnames, gint iteration, gint duration)
 {
@@ -1445,6 +1529,12 @@ tof_suite (GList ** tcnames, gint iteration, gint duration)
   *tcnames = g_list_append (*tcnames, (gpointer) tcname);
   suite_add_tcase (s, tc);
   tcase_add_loop_test (tc, test_tof_bytes_segment, start, end);
+
+  tcname = "alignment";
+  tc = tcase_create (tcname);
+  *tcnames = g_list_append (*tcnames, (gpointer) tcname);
+  suite_add_tcase (s, tc);
+  tcase_add_loop_test (tc, test_tof_alignment, start, end);
 
   tcname = "stream";
   tc = tcase_create (tcname);

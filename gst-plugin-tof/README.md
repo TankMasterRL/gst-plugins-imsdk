@@ -62,7 +62,7 @@ gst-launch-1.0 filesrc location=tof.dcs blocksize=345664 \
 ```
 
 Samples: `gst-sample-apps/gst-qimsdk-tof-depth` (C), `gst-python-examples/gst-tof-depth.py` and
-`gst-tof-pointcloud.py` (Python GI). Tests: `gst-test-framework -s tof` (14 cases; three need the camera).
+`gst-tof-pointcloud.py` (Python GI). Tests: `gst-test-framework -s tof` (15 cases; three need the camera).
 
 ## Depth calibration key file
 
