@@ -16,7 +16,9 @@ pkg_check_modules(GST_VIDEO
   REQUIRED gstreamer-video-1.0>=${GST_VERSION_REQUIRED})
 pkg_check_modules(GST_PBUTILS
   REQUIRED gstreamer-pbutils-1.0>=${GST_VERSION_REQUIRED})
-# suite-tof "pointcloud": parse the tensor caps and meta with the QIM ML base library
+# suite-tof "pointcloud": parse the tensor caps and meta with the QIM ML base library, which may be built in this tree
+set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH ON)
+set(CMAKE_PREFIX_PATH "${PKG_CONFIG_LOCAL_PATH}")
 pkg_check_modules(GST_QCOM_ML
   REQUIRED gstreamer-qcom-oss-ml-1.0>=1.0.0)
 
